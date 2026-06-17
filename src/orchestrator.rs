@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Notify};
 
 type ReconcileSwap = Arc<ArcSwapOption<Vec<RemoteOrder>>>;
@@ -93,10 +93,19 @@ impl App {
         };
         tracing::info!(
             "market {} id={} price_tick={} amount_tick={} min_base={} min_quote={}",
-            market.symbol, market.market_id, market.price_tick, market.amount_tick,
-            market.min_base_amount, market.min_quote_amount
+            market.symbol,
+            market.market_id,
+            market.price_tick,
+            market.amount_tick,
+            market.min_base_amount,
+            market.min_quote_amount
         );
-        Ok(Self { config, creds, market, rest })
+        Ok(Self {
+            config,
+            creds,
+            market,
+            rest,
+        })
     }
 
     fn binance_symbol(&self) -> String {
@@ -115,13 +124,40 @@ impl App {
         } else {
             self.market.min_base_amount.max(0.00001)
         };
+        tracing::info!(
+            "runtime config: mode={:?} symbol={} market_id={} levels_per_side={} base_amount_seed={:.8} capital_usage_pct={:.4} leverage={} min_order_value_usd={:.2} warmup_seconds={:.1} quote_threshold_bps={:.2} send_interval_sec={:.3} max_live_orders={} stale_poller_sec={:.1} ws_ping_interval_sec={:.1} ws_recv_timeout_sec={:.1} ws_account_timeout_sec={:.1} reconnect_base_sec={:.1} reconnect_max_sec={:.1}",
+            mode,
+            self.market.symbol,
+            self.market.market_id,
+            self.config.trading.levels_per_side,
+            base_amount,
+            self.config.trading.capital_usage_percent,
+            self.config.trading.leverage,
+            self.config.trading.min_order_value_usd,
+            self.config.trading.vol_obi.warmup_seconds,
+            self.config.trading.default_quote_update_threshold_bps,
+            self.config.performance.rate_limit_send_interval,
+            self.config.safety.max_live_orders_per_market,
+            self.config.safety.stale_order_poller_interval_sec,
+            self.config.websocket.ping_interval,
+            self.config.websocket.recv_timeout,
+            self.config.websocket.account_recv_timeout,
+            self.config.websocket.reconnect_base_delay,
+            self.config.websocket.reconnect_max_delay,
+        );
         derived.set_base_amount(base_amount);
         // Live: seed 0 so we NEVER quote before capital+position feeds arrive (codex #7).
         // Shadow: effectively unlimited so the pipeline is exercised without account feeds.
         derived.set_max_pos_usd(if mode == Mode::Live { 0.0 } else { 1.0e12 });
 
         // --- Binance alpha feeds (cold) ---
-        if self.config.trading.alpha.source.eq_ignore_ascii_case("binance") {
+        if self
+            .config
+            .trading
+            .alpha
+            .source
+            .eq_ignore_ascii_case("binance")
+        {
             let depth = crate::binance::depth_client::BinanceDepthClient::new(
                 &self.binance_symbol(),
                 self.config.trading.alpha.depth_snapshot_limit,
@@ -147,14 +183,28 @@ impl App {
         let mut live_deps = if mode == Mode::Live {
             Some(
                 self.spawn_live_cold_tasks(
-                    shared_pos.clone(), derived.clone(), ops_rx, evt_tx, reconcile_swap.clone(),
-                    tracked_ids.clone(), halt.clone(),
+                    shared_pos.clone(),
+                    derived.clone(),
+                    ops_rx,
+                    evt_tx,
+                    reconcile_swap.clone(),
+                    tracked_ids.clone(),
+                    halt.clone(),
                 )
                 .await?,
             )
         } else {
             None
         };
+        if mode == Mode::Live {
+            spawn_live_health_logger(
+                self.market.symbol.clone(),
+                shared_alpha.clone(),
+                shared_bbo.clone(),
+                shared_pos.clone(),
+                derived.clone(),
+            );
+        }
 
         // --- HOT market-data task (owns book + signal + order state) ---
         let hot = HotTask::new(
@@ -201,8 +251,12 @@ impl App {
             let _g = deps.sdk_lock.lock().await;
             deps.sender.abort();
             cancel_all_and_verify(
-                &deps.signer, &deps.nonce, &self.rest, self.creds.api_key_index,
-                self.creds.account_index, self.market.market_id,
+                &deps.signer,
+                &deps.nonce,
+                &self.rest,
+                self.creds.api_key_index,
+                self.creds.account_index,
+                self.market.market_id,
             )
             .await;
         }
@@ -243,7 +297,11 @@ impl App {
         );
         let signers_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("signers");
         let signer = Arc::new(Signer::load(
-            &signers_dir, BASE_URL, &self.creds.api_key_private_key, aki, acct,
+            &signers_dir,
+            BASE_URL,
+            &self.creds.api_key_private_key,
+            aki,
+            acct,
         )?);
         let nonce = Arc::new(NonceManager::init(&self.rest, acct, aki).await?);
         let tx_ws = Arc::new(TxWebSocket::new(WS_URL));
@@ -415,7 +473,11 @@ impl App {
                         // trading does not resume the instant the cancel-all below clears the book.
                         let mut r = rsk.lock();
                         r.mark_reconcile(false, "too_many_orders");
-                        r.trigger_pause(&format!("exchange has {} live orders (> {})", orders.len(), max_live));
+                        r.trigger_pause(&format!(
+                            "exchange has {} live orders (> {})",
+                            orders.len(),
+                            max_live
+                        ));
                     } else if now_orphans.is_empty() {
                         rsk.lock().mark_reconcile(true, "poll_ok");
                     } else {
@@ -432,7 +494,11 @@ impl App {
 
                     // SAFETY: too many live orders => something desynced; cancel-all + keep pause parked.
                     if over_cap {
-                        tracing::error!("SAFETY: {} active orders > max {} -> cancel-all", orders.len(), max_live);
+                        tracing::error!(
+                            "SAFETY: {} active orders > max {} -> cancel-all",
+                            orders.len(),
+                            max_live
+                        );
                         let _g = sdk.lock().await; // serialize nonce use with the sender
                         let _ = cancel_all_and_verify(&sgn, &nm, &rest, aki, acct, mkt_id).await;
                         prev_orphans.clear();
@@ -460,23 +526,29 @@ impl App {
                                     let _g = sdk.lock().await;
                                     let n = nm.next();
                                     match sgn.sign_cancel_order(mkt_id as i32, eid, n, aki) {
-                                        Ok(tx) => match rest.send_tx(tx.tx_type, &tx.tx_info).await {
-                                            Ok(r) if r.code == 0 || r.code == 200 => {
-                                                tracing::warn!("cancelled orphan client_id={cid} exch={eid}");
-                                            }
-                                            Ok(r) => {
-                                                tracing::warn!("orphan cancel rejected code={} msg={}", r.code, r.message);
-                                                if nm.hard_refresh(&rest).await.is_err() {
-                                                    nok.store(false, Ordering::SeqCst);
+                                        Ok(tx) => {
+                                            match rest.send_tx(tx.tx_type, &tx.tx_info).await {
+                                                Ok(r) if r.code == 0 || r.code == 200 => {
+                                                    tracing::warn!("cancelled orphan client_id={cid} exch={eid}");
+                                                }
+                                                Ok(r) => {
+                                                    tracing::warn!(
+                                                        "orphan cancel rejected code={} msg={}",
+                                                        r.code,
+                                                        r.message
+                                                    );
+                                                    if nm.hard_refresh(&rest).await.is_err() {
+                                                        nok.store(false, Ordering::SeqCst);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("orphan cancel send err: {e}");
+                                                    if nm.hard_refresh(&rest).await.is_err() {
+                                                        nok.store(false, Ordering::SeqCst);
+                                                    }
                                                 }
                                             }
-                                            Err(e) => {
-                                                tracing::warn!("orphan cancel send err: {e}");
-                                                if nm.hard_refresh(&rest).await.is_err() {
-                                                    nok.store(false, Ordering::SeqCst);
-                                                }
-                                            }
-                                        },
+                                        }
                                         Err(e) => {
                                             nm.acknowledge_failure();
                                             tracing::warn!("orphan cancel sign failed: {e}");
@@ -491,7 +563,11 @@ impl App {
             });
         }
 
-        tracing::warn!("LIVE mode: order sending ENABLED for {} (market_id={})", self.market.symbol, mkt_id);
+        tracing::warn!(
+            "LIVE mode: order sending ENABLED for {} (market_id={})",
+            self.market.symbol,
+            mkt_id
+        );
         Ok(LiveDeps {
             signer,
             nonce,
@@ -513,7 +589,12 @@ async fn cancel_all_orders(
     // "CancelAllTime should be nil"); Python passes timestamp_ms=0.
     let ts = 0i64;
     let n = nonce.next();
-    let tx = match signer.sign_cancel_all_orders(crate::lighter::signer::CANCEL_ALL_TIF_IMMEDIATE, ts, n, aki) {
+    let tx = match signer.sign_cancel_all_orders(
+        crate::lighter::signer::CANCEL_ALL_TIF_IMMEDIATE,
+        ts,
+        n,
+        aki,
+    ) {
         Ok(t) => t,
         Err(e) => {
             nonce.acknowledge_failure();
@@ -522,7 +603,11 @@ async fn cancel_all_orders(
     };
     let resp = rest.send_tx(tx.tx_type, &tx.tx_info).await?;
     if resp.code != 0 && resp.code != 200 {
-        anyhow::bail!("cancel-all rejected: code={} msg={}", resp.code, resp.message);
+        anyhow::bail!(
+            "cancel-all rejected: code={} msg={}",
+            resp.code,
+            resp.message
+        );
     }
     tracing::info!("cancel-all OK (code={})", resp.code);
     Ok(())
@@ -533,7 +618,10 @@ async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        match (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
+        match (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
             (Ok(mut sigint), Ok(mut sigterm)) => {
                 tokio::select! { _ = sigint.recv() => {}, _ = sigterm.recv() => {} }
             }
@@ -572,7 +660,10 @@ pub(crate) async fn cancel_all_and_verify(
                     tracing::info!("verified 0 active orders");
                     return true;
                 }
-                tracing::warn!("{} orders still active after attempt {attempt}", orders.len());
+                tracing::warn!(
+                    "{} orders still active after attempt {attempt}",
+                    orders.len()
+                );
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
@@ -588,6 +679,50 @@ fn auth_map(signer: &Signer, aki: i32, channel: &str) -> HashMap<String, String>
         m.insert(channel.to_string(), tok);
     }
     m
+}
+
+fn age_for_log(age_ms: u64) -> String {
+    if age_ms == u64::MAX {
+        "none".to_string()
+    } else {
+        age_ms.to_string()
+    }
+}
+
+fn spawn_live_health_logger(
+    symbol: String,
+    shared_alpha: Arc<SharedAlpha>,
+    shared_bbo: Arc<SharedBbo>,
+    shared_pos: Arc<SharedPosition>,
+    derived: Arc<Derived>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await; // skip immediate tick; startup logs already describe initial state.
+        loop {
+            tick.tick().await;
+            tracing::info!(
+                target: "lighter_mm::health",
+                "HEALTH symbol={} position={:.8} position_age_ms={} capital_usd={:.4} max_pos_usd={:.2} quota_remaining={:?} md_age_ms={} alpha={:.6} alpha_age_ms={} alpha_samples={} alpha_warmed={} bbo_mid={:.2} bbo_age_ms={} bbo_samples={} bbo_warmed={}",
+                symbol,
+                shared_pos.get(),
+                age_for_log(shared_pos.age_ms()),
+                derived.capital(),
+                derived.max_pos_usd(),
+                derived.quota(),
+                age_for_log(derived.md_age_ms()),
+                shared_alpha.alpha(),
+                age_for_log(shared_alpha.age_ms()),
+                shared_alpha.sample_count(),
+                shared_alpha.warmed_up(),
+                shared_bbo.mid(),
+                age_for_log(shared_bbo.age_ms()),
+                shared_bbo.sample_count(),
+                shared_bbo.warmed_up(),
+            );
+        }
+    });
 }
 
 /// Owned hot-path state + the synchronous decision logic.
@@ -788,7 +923,8 @@ impl HotTask {
         // Hot signal update.
         if let Some(mid) = self.book.mid() {
             self.mid = mid;
-            self.calc.on_book_update(mid, &self.book.bids, &self.book.asks);
+            self.calc
+                .on_book_update(mid, &self.book.bids, &self.book.asks);
             self.maybe_quote();
         }
     }
@@ -837,7 +973,13 @@ impl HotTask {
         let order_size = if capital > 0.0 {
             let raw = capital * self.capital_usage_percent * (self.leverage as f64) / mid;
             let min_quote = self.market.min_quote_amount.max(self.min_order_value_usd);
-            normalize_live_order_size(raw, mid, self.market.amount_tick, self.market.min_base_amount, min_quote)
+            normalize_live_order_size(
+                raw,
+                mid,
+                self.market.amount_tick,
+                self.market.min_base_amount,
+                min_quote,
+            )
         } else {
             self.base_amount
         };
@@ -845,7 +987,13 @@ impl HotTask {
         // Position limit from live capital + the ACTUAL (dynamic) order size (margin reserved for
         // the resting ladder scales with the real clip size).
         let max_pos_usd = if capital > 0.0 {
-            let mp = dynamic_max_position(mid, capital, self.leverage, order_size, self.num_levels as i32);
+            let mp = dynamic_max_position(
+                mid,
+                capital,
+                self.leverage,
+                order_size,
+                self.num_levels as i32,
+            );
             self.derived.set_max_pos_usd(mp);
             mp
         } else {
@@ -869,7 +1017,10 @@ impl HotTask {
         // before the calc is warmed, since the exit is a fixed-bps fallback that needs no vol/OBI).
         // Shadow has no wall-clock warmup so it stays a fast verification tool.
         let in_wallclock_warmup = self.mode == Mode::Live
-            && self.loop_start.map(|s| s.elapsed().as_secs_f64() < self.warmup_seconds).unwrap_or(true);
+            && self
+                .loop_start
+                .map(|s| s.elapsed().as_secs_f64() < self.warmup_seconds)
+                .unwrap_or(true);
         let not_ready = !self.calc.warmed_up() || in_wallclock_warmup;
 
         let levels = if not_ready {
@@ -884,18 +1035,34 @@ impl HotTask {
         } else {
             let l0 = self.calc.quote(mid, position);
             let mut lv = build_quote_levels(
-                l0, mid, position, max_pos_usd, tick, self.num_levels, &self.factors, self.fallback_bps,
+                l0,
+                mid,
+                position,
+                max_pos_usd,
+                tick,
+                self.num_levels,
+                &self.factors,
+                self.fallback_bps,
             );
             // Quality multiplier + inventory-exit bias. The live-metrics adverse-selection quality
             // loop is NOT used in the Python production path, so neutral 1.0 / 0.0 is correct parity.
             lv = apply_quality_spread_multiplier(&lv, mid, 1.0, tick);
             lv = apply_inventory_exit_bias(
-                &lv, mid, position, max_pos_usd, 0.0, self.adverse_threshold_bps, &self.inv_bias, tick,
+                &lv,
+                mid,
+                position,
+                max_pos_usd,
+                0.0,
+                self.adverse_threshold_bps,
+                &self.inv_bias,
+                tick,
             );
             lv
         };
 
-        let ops = self.om.collect_order_operations(&levels, order_size, position, threshold_bps, now_ns);
+        let ops =
+            self.om
+                .collect_order_operations(&levels, order_size, position, threshold_bps, now_ns);
 
         // KEYSTONE: occupy slots the instant ops are emitted (before signing/sending) so the
         // next quote cycle's collect can never duplicate an in-flight order. On send failure
@@ -904,7 +1071,8 @@ impl HotTask {
             self.om.mark_pending(op);
         }
         // Publish tracked client-ids for the reconcile poller's orphan check.
-        self.tracked_ids.store(Arc::new(self.om.tracked_client_ids()));
+        self.tracked_ids
+            .store(Arc::new(self.om.tracked_client_ids()));
 
         match self.mode {
             Mode::Shadow => {

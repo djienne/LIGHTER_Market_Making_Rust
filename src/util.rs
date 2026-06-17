@@ -5,6 +5,13 @@
 //! `int(round(value / tick))`, so raw integer encoding MUST use ties-to-even or signatures
 //! will occasionally differ by one tick. We use `f64::round_ties_even` (Rust >= 1.77).
 
+use std::time::Duration;
+
+/// A websocket session that lasted this long is considered healthy enough to reset reconnect
+/// backoff. Without this, expected periodic reconnects can ratchet all feeds up to max backoff
+/// and create avoidable blind spots after each later disconnect.
+pub const RECONNECT_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(30);
+
 /// Banker's rounding to nearest integer (matches Python `round`).
 #[inline]
 pub fn py_round(x: f64) -> f64 {
@@ -72,6 +79,35 @@ pub fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
     }
 }
 
+/// Delay to use before the next websocket reconnect attempt.
+#[inline]
+pub fn reconnect_delay_after_session(
+    current_backoff: f64,
+    base_backoff: f64,
+    elapsed: Duration,
+) -> f64 {
+    if elapsed >= RECONNECT_BACKOFF_RESET_AFTER {
+        base_backoff
+    } else {
+        current_backoff
+    }
+}
+
+/// Backoff value to carry forward after a websocket session ends.
+#[inline]
+pub fn next_reconnect_backoff(
+    current_backoff: f64,
+    base_backoff: f64,
+    max_backoff: f64,
+    elapsed: Duration,
+) -> f64 {
+    if elapsed >= RECONNECT_BACKOFF_RESET_AFTER {
+        base_backoff
+    } else {
+        (current_backoff * 2.0).min(max_backoff)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +144,20 @@ mod tests {
         // capital 1000, lev 2 => 2000; reserve 2*2*0.0002*50000 = 40; (2000-40)*0.9 = 1764
         let mp = dynamic_max_position(50000.0, 1000.0, 2, 0.0002, 2);
         assert!((mp - 1764.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn websocket_backoff_resets_after_stable_session() {
+        let stable = RECONNECT_BACKOFF_RESET_AFTER + Duration::from_secs(1);
+        assert_eq!(reconnect_delay_after_session(60.0, 5.0, stable), 5.0);
+        assert_eq!(next_reconnect_backoff(60.0, 5.0, 60.0, stable), 5.0);
+    }
+
+    #[test]
+    fn websocket_backoff_grows_after_short_failure() {
+        let short = Duration::from_millis(200);
+        assert_eq!(reconnect_delay_after_session(10.0, 5.0, short), 10.0);
+        assert_eq!(next_reconnect_backoff(10.0, 5.0, 60.0, short), 20.0);
+        assert_eq!(next_reconnect_backoff(40.0, 5.0, 60.0, short), 60.0);
     }
 }

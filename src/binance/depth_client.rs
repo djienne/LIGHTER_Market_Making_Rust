@@ -4,11 +4,12 @@
 
 use crate::binance::obi::BinanceObi;
 use crate::shared::SharedAlpha;
+use crate::util::{next_reconnect_backoff, reconnect_delay_after_session};
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -31,8 +32,12 @@ fn parse_levels(v: Option<&Value>) -> Vec<(f64, f64)> {
         for lvl in arr {
             if let Some(pair) = lvl.as_array() {
                 if pair.len() >= 2 {
-                    let p = pair[0].as_str().and_then(|s| fast_float::parse::<f64, _>(s).ok());
-                    let q = pair[1].as_str().and_then(|s| fast_float::parse::<f64, _>(s).ok());
+                    let p = pair[0]
+                        .as_str()
+                        .and_then(|s| fast_float::parse::<f64, _>(s).ok());
+                    let q = pair[1]
+                        .as_str()
+                        .and_then(|s| fast_float::parse::<f64, _>(s).ok());
                     if let (Some(p), Some(q)) = (p, q) {
                         out.push((p, q));
                     }
@@ -88,12 +93,22 @@ impl BinanceDepthClient {
         let mut backoff = self.reconnect_base;
         loop {
             self.obi.reset();
+            let started = Instant::now();
             match self.session(&url, &http).await {
                 Ok(()) => {}
                 Err(e) => tracing::warn!("binance depth session ended: {e}"),
             }
-            sleep(Duration::from_secs_f64(backoff)).await;
-            backoff = (backoff * 2.0).min(self.reconnect_max);
+            let elapsed = started.elapsed();
+            let delay = reconnect_delay_after_session(backoff, self.reconnect_base, elapsed);
+            tracing::info!(
+                "binance depth reconnecting in {:.3}s after session {:.3}s (next_backoff_base={:.3}s)",
+                delay,
+                elapsed.as_secs_f64(),
+                next_reconnect_backoff(backoff, self.reconnect_base, self.reconnect_max, elapsed),
+            );
+            sleep(Duration::from_secs_f64(delay)).await;
+            backoff =
+                next_reconnect_backoff(backoff, self.reconnect_base, self.reconnect_max, elapsed);
         }
     }
 
@@ -138,7 +153,10 @@ impl BinanceDepthClient {
         .await;
 
         // Phase 2: apply snapshot.
-        let last_update_id = snapshot.get("lastUpdateId").and_then(|x| x.as_i64()).unwrap_or(0);
+        let last_update_id = snapshot
+            .get("lastUpdateId")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0);
         let bids = parse_levels(snapshot.get("bids"));
         let asks = parse_levels(snapshot.get("asks"));
         self.obi.apply_snapshot(bids, asks, last_update_id);
@@ -189,7 +207,10 @@ impl BinanceDepthClient {
             }
             let pu = event.get("pu").and_then(|x| x.as_i64()).unwrap_or(0);
             if self.obi.prev_u() != 0 && pu != self.obi.prev_u() {
-                return Err(anyhow!("sequence gap: pu={pu} expected={}", self.obi.prev_u()));
+                return Err(anyhow!(
+                    "sequence gap: pu={pu} expected={}",
+                    self.obi.prev_u()
+                ));
             }
             self.apply_event(&event);
             self.obi.update_alpha();

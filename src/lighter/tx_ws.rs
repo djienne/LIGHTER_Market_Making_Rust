@@ -99,8 +99,18 @@ impl TxWebSocket {
         let recv_task = tokio::spawn(recv_loop(stream, write.clone(), alive.clone(), resp_tx));
         let ping_task = tokio::spawn(ping_loop(write.clone(), alive.clone()));
 
-        tracing::info!("TxWebSocket connected to {} (keepalive recv-loop + {}s pinger)", self.url, PING_INTERVAL.as_secs());
-        Ok(Conn { write, resp_rx, alive, recv_task, ping_task })
+        tracing::info!(
+            "TxWebSocket connected to {} (keepalive recv-loop + {}s pinger)",
+            self.url,
+            PING_INTERVAL.as_secs()
+        );
+        Ok(Conn {
+            write,
+            resp_rx,
+            alive,
+            recv_task,
+            ping_task,
+        })
     }
 
     fn code_message(resp: &Value) -> (i64, String) {
@@ -172,8 +182,17 @@ impl TxWebSocket {
             Ok(Some(resp)) => {
                 let (code, message) = Self::code_message(&resp);
                 let quota = resp.get("volume_quota_remaining").and_then(|q| q.as_i64());
-                let status = if code == 0 { TxSendStatus::Ok } else { TxSendStatus::Rejected };
-                TxSendResult { status, code, message, quota_remaining: quota }
+                let status = if code == 0 {
+                    TxSendStatus::Ok
+                } else {
+                    TxSendStatus::Rejected
+                };
+                TxSendResult {
+                    status,
+                    code,
+                    message,
+                    quota_remaining: quota,
+                }
             }
             // recv loop ended (socket closed) — a frame was written, outcome unknown.
             Ok(None) => {
@@ -208,7 +227,10 @@ async fn recv_loop(
                     Some("ping") => {
                         // Lighter application-level ping -> must reply with a pong frame.
                         let mut w = write.lock().await;
-                        if w.send(Message::Text(r#"{"type":"pong"}"#.into())).await.is_err() {
+                        if w.send(Message::Text(r#"{"type":"pong"}"#.into()))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -253,5 +275,101 @@ async fn ping_loop(write: Arc<Mutex<WsSink>>, alive: Arc<AtomicBool>) {
             alive.store(false, Ordering::Release);
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TxSendStatus;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn send_batch_drains_info_replies_to_app_ping_and_routes_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            ws.send(Message::Text(r#"{"type":"connected"}"#.into()))
+                .await
+                .unwrap();
+            ws.send(Message::Text(r#"{"type":"ping"}"#.into()))
+                .await
+                .unwrap();
+
+            let mut saw_pong = false;
+            let mut frame = None;
+            for _ in 0..2 {
+                let msg = timeout(Duration::from_secs(2), ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let Message::Text(text) = msg else {
+                    panic!("expected text frame");
+                };
+                if text == r#"{"type":"pong"}"# {
+                    saw_pong = true;
+                } else {
+                    frame = Some(serde_json::from_str::<Value>(&text).unwrap());
+                }
+            }
+            assert!(saw_pong);
+            let frame = frame.expect("sendtxbatch frame");
+            assert_eq!(
+                frame.get("type").and_then(|v| v.as_str()),
+                Some("jsonapi/sendtxbatch")
+            );
+            assert_eq!(
+                frame.pointer("/data/tx_types").and_then(|v| v.as_str()),
+                Some("[14]")
+            );
+            assert_eq!(
+                frame.pointer("/data/tx_infos").and_then(|v| v.as_str()),
+                Some(r#"["signed-tx"]"#)
+            );
+
+            ws.send(Message::Text(
+                r#"{"code":200,"message":"","volume_quota_remaining":42}"#.into(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let tx_ws = TxWebSocket::new(&url);
+        let result = tx_ws.send_batch(&[14], &[String::from("signed-tx")]).await;
+
+        assert_eq!(result.status, TxSendStatus::Ok);
+        assert_eq!(result.code, 0);
+        assert_eq!(result.quota_remaining, Some(42));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_batch_reports_unknown_if_server_closes_after_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let frame = timeout(Duration::from_secs(2), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(frame, Message::Text(_)));
+            ws.close(None).await.unwrap();
+        });
+
+        let tx_ws = TxWebSocket::new(&url);
+        let result = tx_ws.send_batch(&[14], &[String::from("signed-tx")]).await;
+
+        assert_eq!(result.status, TxSendStatus::Unknown);
+        assert_eq!(result.message, "disconnected_after_send");
+        server.await.unwrap();
     }
 }

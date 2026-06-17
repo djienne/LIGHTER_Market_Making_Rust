@@ -44,7 +44,11 @@ pub struct SenderCtx {
 
 /// Run the sender loop (OWNS the rate limiter — it is the only task that touches it, so no
 /// lock is needed and `write_slot` can await freely). Exits when the mailbox sender is dropped.
-pub async fn run(ctx: SenderCtx, mut rate: RateLimiter, mut mailbox: watch::Receiver<Vec<BatchOp>>) {
+pub async fn run(
+    ctx: SenderCtx,
+    mut rate: RateLimiter,
+    mut mailbox: watch::Receiver<Vec<BatchOp>>,
+) {
     use std::sync::atomic::Ordering::SeqCst;
     // Periodic wake so pause-recovery (maybe_recover) runs even when NO new ops arrive — Python
     // attempts recovery every loop iteration. Without this, a quiet mailbox (no quote changes)
@@ -117,7 +121,9 @@ async fn resync_nonce_or_pause(ctx: &SenderCtx, reason: &str) -> bool {
             }
         }
     }
-    tracing::error!("nonce re-sync FAILED ({reason}); pausing trading + blocking resume until re-synced");
+    tracing::error!(
+        "nonce re-sync FAILED ({reason}); pausing trading + blocking resume until re-synced"
+    );
     // Mark the nonce untrustworthy so the sender refuses NEW orders until the poller re-syncs it,
     // and pause so we stop firing batches with a known-bad counter (which restarts the cascade).
     ctx.nonce_ok.store(false, SeqCst);
@@ -143,7 +149,11 @@ fn clear_failed_creates(ctx: &SenderCtx, ops: &[BatchOp]) {
     }
 }
 
-async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+async fn send_once(
+    ctx: &SenderCtx,
+    rate: &mut RateLimiter,
+    ops: Vec<BatchOp>,
+) -> anyhow::Result<()> {
     let cancel = cancel_only(&ops);
     let op_count = ops.len();
 
@@ -176,7 +186,11 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
     let nonce = ctx.nonce.clone();
     let market = ctx.market.clone();
     let ops_for_sign = ops.clone();
-    let signed = match tokio::task::spawn_blocking(move || sign_batch(&signer, &nonce, &market, &ops_for_sign)).await {
+    let signed = match tokio::task::spawn_blocking(move || {
+        sign_batch(&signer, &nonce, &market, &ops_for_sign)
+    })
+    .await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             clear_failed_creates(ctx, &ops);
@@ -192,9 +206,17 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
     let quota = ctx.derived.quota();
     let free_slot = matches!(quota, Some(q) if q <= 0);
     let result = if free_slot && signed.tx_types.len() == 1 {
-        match ctx.rest.send_tx(signed.tx_types[0], &signed.tx_infos[0]).await {
+        match ctx
+            .rest
+            .send_tx(signed.tx_types[0], &signed.tx_infos[0])
+            .await
+        {
             Ok(tx) => crate::types::TxSendResult {
-                status: if tx.code == 0 || tx.code == 200 { TxSendStatus::Ok } else { TxSendStatus::Rejected },
+                status: if tx.code == 0 || tx.code == 200 {
+                    TxSendStatus::Ok
+                } else {
+                    TxSendStatus::Rejected
+                },
                 code: tx.code,
                 message: tx.message,
                 quota_remaining: tx.volume_quota_remaining,
@@ -204,7 +226,9 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
             Err(e) => crate::types::TxSendResult::unknown(format!("rest_err:{e}")),
         }
     } else {
-        ctx.tx_ws.send_batch(&signed.tx_types, &signed.tx_infos).await
+        ctx.tx_ws
+            .send_batch(&signed.tx_types, &signed.tx_infos)
+            .await
     };
 
     // Nonces advanced at sign time, one per signed op. On any non-success outcome we must
@@ -217,6 +241,9 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
             if let Some(q) = result.quota_remaining {
                 ctx.derived.set_quota(Some(q));
                 rate.set_quota(Some(q));
+                if q <= 20 {
+                    tracing::warn!("low volume quota remaining after send: quota={q}");
+                }
             }
             ctx.risk.lock().record_success();
             rate.reset_global_backoff();
@@ -224,7 +251,12 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
                 "SENT {} ops (quota={:?}): {}",
                 op_count,
                 result.quota_remaining,
-                signed.ops.iter().map(|o| format!("{:?}/{}@{:.1}", o.action, o.side, o.price)).collect::<Vec<_>>().join(" ")
+                signed
+                    .ops
+                    .iter()
+                    .map(|o| format!("{:?}/{}@{:.1}", o.action, o.side, o.price))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
             // Optimistic state updates: bind creates/modifies live, clear cancels.
             for op in &signed.ops {
@@ -296,8 +328,12 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
             // us), pull ALL resting quotes now (we still hold sdk_lock, so this is serialized).
             if ctx.risk.lock().is_paused() {
                 crate::orchestrator::cancel_all_and_verify(
-                    &ctx.signer, &ctx.nonce, &ctx.rest, ctx.nonce.api_key_index(),
-                    ctx.account_index, ctx.market.market_id,
+                    &ctx.signer,
+                    &ctx.nonce,
+                    &ctx.rest,
+                    ctx.nonce.api_key_index(),
+                    ctx.account_index,
+                    ctx.market.market_id,
                 )
                 .await;
             }
@@ -308,7 +344,10 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
             // (blocks resume until a later reconcile re-confirms flat) + VERIFIED cancel-all
             // (retries + REST-confirms zero; we hold sdk_lock so it is serialized) + reconcile.
             // Mirrors `_handle_unknown_tx_outcome` (mark_reconcile(false) + hard-refresh + pause).
-            tracing::warn!("tx unknown outcome ({}); resync nonce + pause + verified cancel-all + reconcile", result.message);
+            tracing::warn!(
+                "tx unknown outcome ({}); resync nonce + pause + verified cancel-all + reconcile",
+                result.message
+            );
             resync_nonce_or_pause(ctx, "tx_unknown").await;
             {
                 let mut r = ctx.risk.lock();
@@ -329,7 +368,11 @@ async fn send_once(ctx: &SenderCtx, rate: &mut RateLimiter, ops: Vec<BatchOp>) -
         TxSendStatus::NotSent => {
             // No frame was written → the reserved nonces were definitely NOT consumed. Roll them
             // back locally (no REST round-trip) and let the hot task retry the failed creates.
-            tracing::warn!("tx not sent ({}); rolling back {} reserved nonce(s)", result.message, reserved);
+            tracing::warn!(
+                "tx not sent ({}); rolling back {} reserved nonce(s)",
+                result.message,
+                reserved
+            );
             ctx.nonce.rollback(reserved);
             clear_failed_creates(ctx, &signed.ops);
         }

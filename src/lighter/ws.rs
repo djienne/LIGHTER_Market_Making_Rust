@@ -7,6 +7,7 @@
 //! cold-path account tasks enqueue to channels). A buggy callback never tears down the
 //! socket — it is caught and logged.
 
+use crate::util::{next_reconnect_backoff, reconnect_delay_after_session};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -72,13 +73,24 @@ pub async fn subscribe_loop<F, D>(
 {
     let mut backoff = opts.reconnect_base;
     loop {
+        let started = Instant::now();
         match session(&opts, reconnect.as_deref(), &mut on_message).await {
             Ok(()) => {}
             Err(e) => tracing::info!("{} ws disconnected: {e}", opts.label),
         }
         on_disconnect();
-        sleep(Duration::from_secs_f64(backoff + jitter(backoff))).await;
-        backoff = (backoff * 2.0).min(opts.reconnect_max);
+        let elapsed = started.elapsed();
+        let delay = reconnect_delay_after_session(backoff, opts.reconnect_base, elapsed);
+        let sleep_for = delay + jitter(delay);
+        tracing::info!(
+            "{} reconnecting in {:.3}s after session {:.3}s (next_backoff_base={:.3}s)",
+            opts.label,
+            sleep_for,
+            elapsed.as_secs_f64(),
+            next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed),
+        );
+        sleep(Duration::from_secs_f64(sleep_for)).await;
+        backoff = next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed);
     }
 }
 
@@ -86,8 +98,11 @@ pub async fn subscribe_loop<F, D>(
 /// (private channels: account_orders / account_all / user_stats). The server token TTL is
 /// ~10 min; on expiry the server drops the socket, the session ends, and we reconnect with a
 /// fresh token. `auth_fn` returns the channel->token map for the upcoming connection.
-pub async fn subscribe_loop_authed<F, A>(mut opts: SubscribeOptions, mut auth_fn: A, mut on_message: F)
-where
+pub async fn subscribe_loop_authed<F, A>(
+    mut opts: SubscribeOptions,
+    mut auth_fn: A,
+    mut on_message: F,
+) where
     F: FnMut(&Value),
     A: FnMut() -> std::collections::HashMap<String, String>,
 {
@@ -100,12 +115,23 @@ where
             backoff = (backoff * 2.0).min(opts.reconnect_max);
             continue;
         }
+        let started = Instant::now();
         match session(&opts, None, &mut on_message).await {
             Ok(()) => {}
             Err(e) => tracing::info!("{} ws disconnected: {e}", opts.label),
         }
-        sleep(Duration::from_secs_f64(backoff + jitter(backoff))).await;
-        backoff = (backoff * 2.0).min(opts.reconnect_max);
+        let elapsed = started.elapsed();
+        let delay = reconnect_delay_after_session(backoff, opts.reconnect_base, elapsed);
+        let sleep_for = delay + jitter(delay);
+        tracing::info!(
+            "{} reconnecting in {:.3}s after session {:.3}s (next_backoff_base={:.3}s)",
+            opts.label,
+            sleep_for,
+            elapsed.as_secs_f64(),
+            next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed),
+        );
+        sleep(Duration::from_secs_f64(sleep_for)).await;
+        backoff = next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed);
     }
 }
 
@@ -139,7 +165,10 @@ where
         // Non-blocking forced-reconnect check.
         if let Some(rc) = reconnect {
             if rc.notified().now_or_never().is_some() {
-                tracing::info!("{} reconnect requested; dropping for fresh snapshot", opts.label);
+                tracing::info!(
+                    "{} reconnect requested; dropping for fresh snapshot",
+                    opts.label
+                );
                 return Ok(());
             }
         }
@@ -179,7 +208,9 @@ where
                 match data.get("type").and_then(|v| v.as_str()) {
                     Some("ping") => {
                         // Server app-level keepalive — reply, but do NOT count as feed data.
-                        let _ = write.send(Message::Text(r#"{"type":"pong"}"#.to_string())).await;
+                        let _ = write
+                            .send(Message::Text(r#"{"type":"pong"}"#.to_string()))
+                            .await;
                     }
                     Some("subscribed") => {}
                     _ => {

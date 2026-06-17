@@ -8,6 +8,7 @@ counted. Tracks the max order-count seen for the end-of-run summary.
 Usage: python3 scripts_monitor.py [interval_sec] [max_orders]
 """
 import os, sys, time, asyncio
+from datetime import datetime, timezone
 sys.path.insert(0, '/home/ubuntu/lighter_MM')
 from dotenv import load_dotenv
 load_dotenv('/home/ubuntu/lighter_MM/.env')
@@ -31,8 +32,11 @@ async def snap(sc, acc_api):
         tok,_=sc.create_auth_token_with_expiry()
         resp=requests.get(URL+'/api/v1/accountActiveOrders', params={'account_index':ACCT,'market_id':MARKET,'auth':tok}, timeout=10)
         n=len(resp.json().get('orders',[]))
-    except Exception as e: n=f'errOrд:{e}'
+    except Exception as e: n=f'errOrders:{e}'
     return pos, n, coll
+
+def utc_ts():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
 async def main():
     interval=int(sys.argv[1]) if len(sys.argv)>1 else 30
@@ -40,7 +44,8 @@ async def main():
     acc_api=lighter.AccountApi(api)
     sc=lighter.SignerClient(url=URL, account_index=ACCT, api_private_keys={AKI:PRIV})
     max_seen=0; violations=0
-    print(f"MON start: interval={interval}s max_orders={MAX_ORDERS} acct={ACCT} aki={AKI} market={MARKET}", flush=True)
+    start=time.monotonic()
+    print(f"{utc_ts()} MON start: pid={os.getpid()} interval={interval}s max_orders={MAX_ORDERS} acct={ACCT} aki={AKI} market={MARKET}", flush=True)
     while True:
         pos,n,coll=await snap(sc, acc_api)
         alert=''
@@ -49,7 +54,8 @@ async def main():
             if n>MAX_ORDERS:
                 violations+=1
                 alert=f'  <<< ALERT orders={n} > MAX {MAX_ORDERS} (violation #{violations})'
-        print(f"{time.strftime('%H:%M:%S')} MON pos={pos} orders={n} coll={coll} max_seen={max_seen}{alert}", flush=True)
+        elapsed=int(time.monotonic()-start)
+        print(f"{utc_ts()} MON elapsed_s={elapsed} pos={pos} orders={n} coll={coll} max_seen={max_seen} violations={violations}{alert}", flush=True)
         await asyncio.sleep(interval)
 
 asyncio.run(main())

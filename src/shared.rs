@@ -57,8 +57,23 @@ impl SharedAlpha {
     }
 
     #[inline]
+    pub fn sample_count(&self) -> u64 {
+        self.sample_count.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn age_ms(&self) -> u64 {
+        let last = self.last_update_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            u64::MAX
+        } else {
+            now_ms().saturating_sub(last)
+        }
+    }
+
+    #[inline]
     pub fn warmed_up(&self) -> bool {
-        self.sample_count.load(Ordering::Acquire) >= self.min_samples
+        self.sample_count() >= self.min_samples
     }
 
     #[inline]
@@ -136,7 +151,20 @@ impl SharedBbo {
     }
     #[inline]
     pub fn warmed_up(&self) -> bool {
-        self.sample_count.load(Ordering::Acquire) >= self.min_samples
+        self.sample_count() >= self.min_samples
+    }
+    #[inline]
+    pub fn sample_count(&self) -> u64 {
+        self.sample_count.load(Ordering::Acquire)
+    }
+    #[inline]
+    pub fn age_ms(&self) -> u64 {
+        let last = self.last_update_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            u64::MAX
+        } else {
+            now_ms().saturating_sub(last)
+        }
     }
     #[inline]
     pub fn is_stale(&self, threshold_ms: u64) -> bool {

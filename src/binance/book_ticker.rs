@@ -2,11 +2,12 @@
 //! Lightweight best-bid/ask feed (reference / sanity). Cold-path async task.
 
 use crate::shared::SharedBbo;
+use crate::util::{next_reconnect_backoff, reconnect_delay_after_session};
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -22,7 +23,9 @@ pub struct BinanceBookTickerClient {
 
 #[inline]
 fn f(v: &Value, k: &str) -> Option<f64> {
-    v.get(k).and_then(|x| x.as_str()).and_then(|s| fast_float::parse::<f64, _>(s).ok())
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .and_then(|s| fast_float::parse::<f64, _>(s).ok())
 }
 
 impl BinanceBookTickerClient {
@@ -39,19 +42,31 @@ impl BinanceBookTickerClient {
         let url = format!("{}/{}@bookTicker", WS_BASE, self.symbol);
         let mut backoff = self.reconnect_base;
         loop {
+            let started = Instant::now();
             match self.session(&url).await {
                 Ok(()) => {}
                 Err(e) => tracing::warn!("binance bookTicker session ended: {e}"),
             }
             // Drop the stale BBO on disconnect so consumers see it as cold/stale until re-warm.
             self.shared.reset();
-            sleep(Duration::from_secs_f64(backoff)).await;
-            backoff = (backoff * 2.0).min(self.reconnect_max);
+            let elapsed = started.elapsed();
+            let delay = reconnect_delay_after_session(backoff, self.reconnect_base, elapsed);
+            tracing::info!(
+                "binance bookTicker reconnecting in {:.3}s after session {:.3}s (next_backoff_base={:.3}s)",
+                delay,
+                elapsed.as_secs_f64(),
+                next_reconnect_backoff(backoff, self.reconnect_base, self.reconnect_max, elapsed),
+            );
+            sleep(Duration::from_secs_f64(delay)).await;
+            backoff =
+                next_reconnect_backoff(backoff, self.reconnect_base, self.reconnect_max, elapsed);
         }
     }
 
     async fn session(&self, url: &str) -> Result<()> {
-        let (ws_stream, _) = connect_async(url).await.context("binance bookTicker connect")?;
+        let (ws_stream, _) = connect_async(url)
+            .await
+            .context("binance bookTicker connect")?;
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("binance bookTicker connected: {url}");
         loop {

@@ -52,11 +52,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    let config = Config::load(&config_path)
-        .unwrap_or_else(|e| {
-            tracing::warn!("config load failed ({e}); using defaults");
-            serde_json::from_str("{}").unwrap()
-        });
+    let config = Config::load(&config_path).unwrap_or_else(|e| {
+        tracing::warn!("config load failed ({e}); using defaults");
+        serde_json::from_str("{}").unwrap()
+    });
 
     let mut creds = Credentials::from_env().unwrap_or_else(|_| Credentials {
         api_key_private_key: String::new(),
@@ -69,7 +68,20 @@ async fn main() -> Result<()> {
         creds.market_symbol = s;
     }
 
-    tracing::info!("lighter-mm starting: symbol={} mode={:?}", creds.market_symbol, mode);
+    let run_id = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    tracing::info!(
+        "lighter-mm starting: run_id={} pid={} symbol={} mode={:?} config={} cwd={} account_index={} api_key_index={}",
+        run_id,
+        std::process::id(),
+        creds.market_symbol,
+        mode,
+        config_path.display(),
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".into()),
+        creds.account_index,
+        creds.api_key_index,
+    );
     let app = App::bootstrap(config, creds).await?;
     app.run(mode).await
 }
