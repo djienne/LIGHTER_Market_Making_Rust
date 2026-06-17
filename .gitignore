@@ -1,0 +1,17 @@
+# Rust build output
+/target
+
+# Secrets / credentials (NEVER commit)
+.env
+*.pem
+
+# Runtime output
+/logs
+*.log
+
+# Workflow scripts (session scratch)
+/.workflows
+
+# Editor / OS
+*.swp
+.DS_Store

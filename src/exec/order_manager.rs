@@ -1,0 +1,395 @@
+//! Order lifecycle state machine + op collection — port of `OrderManager`,
+//! `collect_order_operations`, the client->exchange id map, and reconcile processing.
+//!
+//! OWNED by the synchronous decision (market-data) task — single owner, no locks. Cross-task
+//! inputs (account_orders WS confirmations, paced-send results) arrive as LOSSLESS
+//! `OrderEvent`s drained each cycle; reconcile snapshots arrive via a last-writer-wins slot.
+//! On send success the sender enqueues an optimistic `BindLive` so the slot is occupied
+//! immediately (prevents duplicate creates); the exchange id is resolved later from WS.
+
+use crate::lighter::messages::{parse_f64, RemoteOrder};
+use crate::types::{BatchOp, OrderAction, OrderEvent, Side, SideStatus};
+use crate::util::price_change_bps;
+use std::collections::HashMap;
+use std::time::Instant;
+
+const MAX_CLIENT_ORDER_INDEX: i64 = 281_474_976_710_655; // 2^48 - 1
+const ID_MAP_CAP: usize = 200;
+pub const EPSILON: f64 = 1e-9;
+
+#[derive(Debug, Clone)]
+pub struct OrderSlot {
+    pub status: SideStatus,
+    pub order_id: Option<i64>,
+    pub price: Option<f64>,
+    pub size: Option<f64>,
+    pub updated_at: Instant,
+}
+
+impl OrderSlot {
+    fn idle() -> Self {
+        Self {
+            status: SideStatus::Idle,
+            order_id: None,
+            price: None,
+            size: None,
+            updated_at: Instant::now(),
+        }
+    }
+}
+
+pub struct OrderManager {
+    num_levels: usize,
+    amount_tick: f64,
+    bids: Vec<OrderSlot>,
+    asks: Vec<OrderSlot>,
+    client_to_exchange: HashMap<i64, i64>,
+    last_client_order_index: i64,
+}
+
+impl OrderManager {
+    pub fn new(num_levels: usize, amount_tick: f64) -> Self {
+        Self {
+            num_levels,
+            amount_tick,
+            bids: vec![OrderSlot::idle(); num_levels],
+            asks: vec![OrderSlot::idle(); num_levels],
+            client_to_exchange: HashMap::new(),
+            last_client_order_index: 0,
+        }
+    }
+
+    #[inline]
+    fn slot(&self, side: Side, level: usize) -> &OrderSlot {
+        match side {
+            Side::Buy => &self.bids[level],
+            Side::Sell => &self.asks[level],
+        }
+    }
+    #[inline]
+    fn slot_mut(&mut self, side: Side, level: usize) -> &mut OrderSlot {
+        match side {
+            Side::Buy => &mut self.bids[level],
+            Side::Sell => &mut self.asks[level],
+        }
+    }
+
+    /// `next_client_order_index`: monotonic-ish id from time_ns, never reusing the last.
+    pub fn next_client_order_index(&mut self, now_ns: i64) -> i64 {
+        let mut new_id = now_ns.rem_euclid(MAX_CLIENT_ORDER_INDEX);
+        if new_id <= self.last_client_order_index {
+            new_id = (self.last_client_order_index + 1).rem_euclid(MAX_CLIENT_ORDER_INDEX + 1);
+        }
+        self.last_client_order_index = new_id;
+        new_id
+    }
+
+    pub fn resolve_exchange_id(&self, client_id: i64) -> Option<i64> {
+        self.client_to_exchange.get(&client_id).copied()
+    }
+
+    fn size_change_requires_update(&self, existing: Option<f64>, new: f64) -> bool {
+        match existing {
+            None => true,
+            Some(e) => {
+                let tol = if self.amount_tick > 0.0 { self.amount_tick } else { EPSILON };
+                (e - new).abs() >= tol.max(EPSILON)
+            }
+        }
+    }
+
+    fn is_reducing_side(side: Side, position: f64) -> bool {
+        (position > EPSILON && side == Side::Sell) || (position < -EPSILON && side == Side::Buy)
+    }
+
+    /// Port of `collect_order_operations`. `level_prices` is `[(Option<bid>, Option<ask>)]`.
+    pub fn collect_order_operations(
+        &mut self,
+        level_prices: &[(Option<f64>, Option<f64>)],
+        base_amount: f64,
+        position: f64,
+        effective_threshold_bps: f64,
+        now_ns: i64,
+    ) -> Vec<BatchOp> {
+        let mut ops = Vec::new();
+        for (level, &(buy_price, sell_price)) in level_prices.iter().enumerate() {
+            for (side, new_price) in [(Side::Buy, buy_price), (Side::Sell, sell_price)] {
+                let new_size = base_amount;
+                let reduce_only = Self::is_reducing_side(side, position);
+
+                let slot = self.slot(side, level);
+                let existing_id = slot.order_id;
+                let existing_price = slot.price;
+                let existing_size = slot.size;
+
+                let new_price = match new_price {
+                    None => {
+                        // suppressed -> cancel any live order
+                        if let Some(cid) = existing_id {
+                            if let Some(eid) = self.resolve_exchange_id(cid) {
+                                ops.push(BatchOp {
+                                    side,
+                                    level,
+                                    action: OrderAction::Cancel,
+                                    price: 0.0,
+                                    size: 0.0,
+                                    client_order_id: cid,
+                                    exchange_id: Some(eid),
+                                    reduce_only: false,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    Some(p) => p,
+                };
+                if new_size <= 0.0 || new_price <= 0.0 {
+                    continue;
+                }
+
+                if let Some(cid) = existing_id {
+                    let exchange_id = match self.resolve_exchange_id(cid) {
+                        Some(e) => e,
+                        None => continue, // awaiting exchange order_index
+                    };
+                    let change_bps = price_change_bps(existing_price.unwrap_or(0.0), new_price);
+                    let size_changed = self.size_change_requires_update(existing_size, new_size);
+                    let needs_modify = existing_price.is_none() || change_bps > effective_threshold_bps || size_changed;
+                    if !needs_modify {
+                        continue;
+                    }
+                    ops.push(BatchOp {
+                        side,
+                        level,
+                        action: OrderAction::Modify,
+                        price: new_price,
+                        size: new_size,
+                        client_order_id: cid,
+                        exchange_id: Some(exchange_id),
+                        reduce_only,
+                    });
+                } else {
+                    let new_order_id = self.next_client_order_index(now_ns);
+                    ops.push(BatchOp {
+                        side,
+                        level,
+                        action: OrderAction::Create,
+                        price: new_price,
+                        size: new_size,
+                        client_order_id: new_order_id,
+                        exchange_id: None,
+                        reduce_only,
+                    });
+                }
+            }
+        }
+        ops
+    }
+
+    // ---- slot mutation (only via events / reconcile) ----
+
+    pub fn mark_status(&mut self, side: Side, level: usize, status: SideStatus) {
+        let s = self.slot_mut(side, level);
+        s.status = status;
+        s.updated_at = Instant::now();
+    }
+
+    fn bind_live(&mut self, side: Side, level: usize, order_id: i64, price: f64, size: f64) {
+        let s = self.slot_mut(side, level);
+        s.order_id = Some(order_id);
+        s.price = Some(price);
+        s.size = Some(size);
+        s.status = SideStatus::Live;
+        s.updated_at = Instant::now();
+    }
+
+    fn clear_live(&mut self, side: Side, level: usize) {
+        *self.slot_mut(side, level) = OrderSlot::idle();
+    }
+
+    fn clear_all(&mut self) {
+        for lvl in 0..self.num_levels {
+            self.clear_live(Side::Buy, lvl);
+            self.clear_live(Side::Sell, lvl);
+        }
+    }
+
+    /// Drain one hot order event (lossless). Call until the queue is empty.
+    pub fn apply_event(&mut self, evt: OrderEvent) {
+        match evt {
+            OrderEvent::BindLive { side, level, client_order_id, exchange_id, price, size } => {
+                if let Some(eid) = exchange_id {
+                    self.record_id_mapping(client_order_id, eid);
+                }
+                self.bind_live(side, level, client_order_id, price, size);
+            }
+            OrderEvent::ClearLive { side, level, client_order_id } => {
+                // Only clear if the slot still holds THIS order (a late clear for an old
+                // order must not wipe a freshly-placed one in the same slot). id 0 = wildcard.
+                let cur = self.slot(side, level).order_id;
+                if client_order_id == 0 || cur == Some(client_order_id) {
+                    self.clear_live(side, level);
+                }
+            }
+            OrderEvent::ClearAll => self.clear_all(),
+        }
+    }
+
+    fn record_id_mapping(&mut self, client_id: i64, exchange_id: i64) {
+        self.client_to_exchange.insert(client_id, exchange_id);
+        if self.client_to_exchange.len() > ID_MAP_CAP {
+            // Keep currently-live ids + drop arbitrary extras (bounded growth).
+            let live: std::collections::HashSet<i64> = self
+                .bids
+                .iter()
+                .chain(self.asks.iter())
+                .filter_map(|s| s.order_id)
+                .collect();
+            let mut kept: HashMap<i64, i64> = HashMap::new();
+            for (&k, &v) in self.client_to_exchange.iter() {
+                if live.contains(&k) {
+                    kept.insert(k, v);
+                }
+            }
+            // top up to ~100 recent (by id order) without exceeding cap
+            let mut others: Vec<(i64, i64)> = self
+                .client_to_exchange
+                .iter()
+                .filter(|(k, _)| !live.contains(k))
+                .map(|(&k, &v)| (k, v))
+                .collect();
+            others.sort_by_key(|(k, _)| *k);
+            for (k, v) in others.into_iter().rev().take(100) {
+                kept.insert(k, v);
+            }
+            self.client_to_exchange = kept;
+        }
+    }
+
+    /// Update the client->exchange id map from an exchange order snapshot.
+    pub fn update_id_mapping_from_orders(&mut self, remote: &[RemoteOrder]) {
+        for o in remote {
+            if let (Some(c), Some(e)) = (o.client_order_index, o.order_index) {
+                self.record_id_mapping(c, e);
+            }
+        }
+    }
+
+    /// Apply a full reconcile snapshot: clear slots whose id is no longer live, refresh
+    /// price/size for tracked orders. Returns true if any slot changed (for logging).
+    pub fn process_reconcile(&mut self, remote: &[RemoteOrder]) {
+        self.update_id_mapping_from_orders(remote);
+        let live_ids: std::collections::HashSet<i64> =
+            remote.iter().filter(|o| o.is_live()).filter_map(|o| o.client_order_index).collect();
+
+        for lvl in 0..self.num_levels {
+            if let Some(id) = self.bids[lvl].order_id {
+                if !live_ids.contains(&id) {
+                    self.clear_live(Side::Buy, lvl);
+                }
+            }
+            if let Some(id) = self.asks[lvl].order_id {
+                if !live_ids.contains(&id) {
+                    self.clear_live(Side::Sell, lvl);
+                }
+            }
+        }
+
+        let by_client: HashMap<i64, &RemoteOrder> =
+            remote.iter().filter_map(|o| o.client_order_index.map(|c| (c, o))).collect();
+        for lvl in 0..self.num_levels {
+            for side in [Side::Buy, Side::Sell] {
+                if let Some(cid) = self.slot(side, lvl).order_id {
+                    if let Some(o) = by_client.get(&cid) {
+                        // skip if side mismatch
+                        match (side, o.is_ask) {
+                            (Side::Buy, Some(true)) | (Side::Sell, Some(false)) => continue,
+                            _ => {}
+                        }
+                        let price = o.price.as_deref().map(parse_f64).or(self.slot(side, lvl).price);
+                        let size = o
+                            .remaining_base_amount
+                            .as_deref()
+                            .map(parse_f64)
+                            .or(self.slot(side, lvl).size);
+                        match (price, size) {
+                            (Some(p), Some(s)) => self.bind_live(side, lvl, cid, p, s),
+                            _ => self.mark_status(side, lvl, SideStatus::Live),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set of currently-tracked client ids (for reconcile diffing).
+    pub fn tracked_client_ids(&self) -> Vec<i64> {
+        self.bids.iter().chain(self.asks.iter()).filter_map(|s| s.order_id).collect()
+    }
+
+    pub fn slot_status(&self, side: Side, level: usize) -> SideStatus {
+        self.slot(side, level).status
+    }
+    pub fn slot_age(&self, side: Side, level: usize) -> std::time::Duration {
+        self.slot(side, level).updated_at.elapsed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lvls(n: usize, b: Option<f64>, a: Option<f64>) -> Vec<(Option<f64>, Option<f64>)> {
+        let mut v = vec![(None, None); n];
+        v[0] = (b, a);
+        v
+    }
+
+    #[test]
+    fn creates_then_skips_after_bind() {
+        let mut om = OrderManager::new(1, 0.00001);
+        let ops = om.collect_order_operations(&lvls(1, Some(99.0), Some(101.0)), 0.001, 0.0, 8.0, 1_000);
+        assert_eq!(ops.len(), 2); // create bid + ask
+        assert!(ops.iter().all(|o| o.action == OrderAction::Create));
+        // optimistic bind on send success
+        for o in &ops {
+            om.apply_event(OrderEvent::BindLive {
+                side: o.side, level: o.level, client_order_id: o.client_order_id,
+                exchange_id: Some(o.client_order_id + 1_000_000), price: o.price, size: o.size,
+            });
+        }
+        // same prices -> no ops (within threshold, size unchanged)
+        let ops2 = om.collect_order_operations(&lvls(1, Some(99.0), Some(101.0)), 0.001, 0.0, 8.0, 2_000);
+        assert_eq!(ops2.len(), 0);
+    }
+
+    #[test]
+    fn reprices_when_moved_beyond_threshold() {
+        let mut om = OrderManager::new(1, 0.00001);
+        let ops = om.collect_order_operations(&lvls(1, Some(100.0), Some(101.0)), 0.001, 0.0, 8.0, 1);
+        for o in &ops {
+            om.apply_event(OrderEvent::BindLive {
+                side: o.side, level: o.level, client_order_id: o.client_order_id,
+                exchange_id: Some(o.client_order_id + 1), price: o.price, size: o.size,
+            });
+        }
+        // move bid by ~100 bps (100 -> 99) => modify
+        let ops2 = om.collect_order_operations(&lvls(1, Some(99.0), Some(101.0)), 0.001, 0.0, 8.0, 2);
+        assert!(ops2.iter().any(|o| o.action == OrderAction::Modify && o.side == Side::Buy));
+    }
+
+    #[test]
+    fn suppressed_side_cancels() {
+        let mut om = OrderManager::new(1, 0.00001);
+        let ops = om.collect_order_operations(&lvls(1, Some(99.0), Some(101.0)), 0.001, 0.0, 8.0, 1);
+        for o in &ops {
+            om.apply_event(OrderEvent::BindLive {
+                side: o.side, level: o.level, client_order_id: o.client_order_id,
+                exchange_id: Some(o.client_order_id + 1), price: o.price, size: o.size,
+            });
+        }
+        // suppress bid (None) -> cancel op for the live bid
+        let ops2 = om.collect_order_operations(&lvls(1, None, Some(101.0)), 0.001, 0.0, 8.0, 2);
+        assert!(ops2.iter().any(|o| o.action == OrderAction::Cancel && o.side == Side::Buy));
+    }
+}
