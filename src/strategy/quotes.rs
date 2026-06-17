@@ -2,8 +2,7 @@
 //! `_apply_quality_spread_multiplier`, `_apply_inventory_exit_bias`,
 //! `_fallback_reduce_only_quote_levels`, `_normalize_live_order_size`.
 //!
-//! Pure functions (no global state) so they are exhaustively testable. The CJ estimator
-//! gate is omitted (CJ is out of scope); for the vol_obi engine it is always-allow.
+//! Pure functions (no global state) so they are exhaustively testable.
 
 use crate::config::InventoryExitBias;
 

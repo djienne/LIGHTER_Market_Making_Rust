@@ -6,8 +6,8 @@ ladder spacing, adjuster math, pure collector rules, vol/OBI to 1e-17). Every ga
 wiring*, not math. "Rust may be better, not worse" — we only close gaps where Rust is wrong/weaker.
 
 Config values (config.json): capital_usage_percent=0.15, leverage=2, min_order_value_usd=14.5,
-vol_obi.warmup_seconds=600, vol_obi.min_half_spread_bps=4.0, cartea_jaimungal.min_half_spread_bps=8.0,
-safety.stale_order_debounce_count=2, rate_limit_send_interval=0.15. All already parsed in config.rs.
+vol_obi.warmup_seconds=600, vol_obi.min_half_spread_bps=4.0, safety.stale_order_debounce_count=2,
+rate_limit_send_interval=0.15. All already parsed in config.rs.
 
 ---
 
@@ -82,19 +82,7 @@ No live impact (config sets 0.15 explicitly).
 
 ---
 
-## Out of scope / intentional (NOT fixing)
-- Cartea-Jaimungal alpha (dropped on purpose). NOTE: its `min_half_spread_bps` is still used by Python
-  ONLY as a numeric spread FLOOR in `fallback_reduce_only` — that floor (Group, see below) IS ported.
-
-## Group A0 — fallback_reduce_only floor uses CJ min (MEDIUM) [audit #1]
-**Gap:** Rust fallback depth uses `max(vol_obi.min_half_spread_bps,1)`=4bps; Python uses
-`max(cj.min_half_spread_bps, vol_obi.min, 1)`=8bps → Rust reduce-only exit sits at HALF the distance.
-**Fix:** extract `cartea_jaimungal.min_half_spread_bps` from config and set
-`fallback_bps = cj_min.max(vo.min).max(1.0)`.
-
----
-
 ## Execution order
-H (trivial) → A0 (floor) → B (dyn base) → A (quality loop) → C (warmup) → D (calc reset) →
+H (trivial) → B (dyn base) → A (quality loop) → C (warmup) → D (calc reset) →
 E (binance reset) → F (pauses) → G (freshest-reborrow, careful). Build+test after each;
 re-smoke (verify ≤4 + stability) → 1-hour run.

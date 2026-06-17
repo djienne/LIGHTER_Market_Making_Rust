@@ -40,8 +40,6 @@ pub struct Trading {
     pub inventory_exit_bias: InventoryExitBias,
     pub vol_obi: VolObiCfg,
     pub alpha: AlphaCfg,
-    pub cartea_jaimungal: serde_json::Value,
-    pub cj_estimator: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]

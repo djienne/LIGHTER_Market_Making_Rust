@@ -20,8 +20,7 @@ Source of truth for behavior: `lighter_MM/` (Python, currently live).
    **We FFI into the exact same `.so`** the Python SDK uses → identical signatures.
 3. **Hot path is synchronous, lock-free, allocation-free** in steady state. Cold path
    is async (tokio), does all I/O (signing, network, disk, reconciliation).
-4. **Phased delivery.** The live engine is `vol_obi`. Ship that path end-to-end first;
-   Cartea-Jaimungal (CJ) HJB engine is phase 2.
+4. **Phased delivery.** The live engine is `vol_obi`; ship that path end-to-end first.
 
 ---
 
@@ -73,9 +72,6 @@ tx's own fields; both use the identical library).
 ### 1.4 Quote engine = `vol_obi` ONLY
 - **`vol_obi` (the live engine):** Welford rolling vol + OBI z-score → fair price + skewed
   half-spread. Cython `_vol_obi_fast.pyx` is the hot impl. ✓ PORTED (parity-verified).
-- **Cartea-Jaimungal is DROPPED.** It is deprecated/unused leftover in the Python bot
-  (unrelated to the OBI strategy). NOT ported. `subscribe_to_public_trades` (which only fed
-  the CJ estimator) and all `_cj_*` machinery are skipped. `nalgebra` dep can be removed.
 
 ### 1.5 Hot vs cold (from Python + standx)
 - **Hot (per orderbook tick, 10–1000 Hz):** parse delta → update local book → mid →
@@ -99,7 +95,7 @@ tx's own fields; both use the identical library).
  Lighter WS /stream ──► md_task (HOT, single writer) ─────────────────────────────────────────┐ │
    order_book/{m}        • parse delta (serde/simd)                                            │ │
    ticker/{m}            • update LocalBook (sorted Vec + binary search, in-task, no lock)     │ │
-   trade/{m}             • mid; VolObi rolling stats (Welford ring buffer)                     │ │
+                         • mid; VolObi rolling stats (Welford ring buffer)                     │ │
                          • read SharedAlpha/SharedPosition/derived params (atomic)             │ │
                          • calculate_order_prices → quality/inv bias → collect ops             │ │
                          • watch::Sender.send(ops)   ───────────► mailbox (always-freshest)    │ │
@@ -178,7 +174,6 @@ lighter_MM_RUST/
 │   │   ├── vol_obi.rs          # VolObiCalculator (on_book_update, quote)  [PHASE 1]
 │   │   └── quotes.rs           # calculate_order_prices, spread factors, ladder,
 │   │                           #   quality multiplier, inventory exit bias, fallback
-│   │   # NOTE: cartea_jaimungal / cj_estimator are NOT ported (deprecated, unused).
 │   │
 │   ├── binance/
 │   │   ├── mod.rs
@@ -223,8 +218,7 @@ lighter_MM_RUST/
 `Cargo.toml` deps: `tokio`(full,parking_lot), `tokio-tungstenite`(native-tls),
 `futures-util`, `serde`/`serde_json`, `reqwest`(json,rustls), `libloading`,
 `tracing`/`tracing-subscriber`, `anyhow`/`thiserror`, `crossbeam`/`crossbeam-utils`,
-`parking_lot`, `arc-swap`, `csv`, `dotenvy`, `fast-float`, `hex`, `chrono`,
-and (phase 2) `nalgebra` for the HJB matrix exponential.
+`parking_lot`, `arc-swap`, `csv`, `dotenvy`, `fast-float`, `hex`, `chrono`.
 
 ---
 
@@ -246,8 +240,8 @@ evict oldest then forward-Welford add; cache `mean`,`std`; guard `M2<0→0`. `st
   raw bid/ask = fair∓depth*tick; min-spread floor vs mid; snap floor/ceil; `None` if bid≥ask.
 
 ### 5.3 `strategy::quotes` (hot)
-- `calculate_order_prices`: gate (CJ readiness if CJ engine) → L0 quote → position-limit
-  suppression (`|pos*mid|≥max_pos_usd` ⇒ drop add side; both ⇒ reduce-only fallback) →
+- `calculate_order_prices`: L0 quote → position-limit suppression
+  (`|pos*mid|≥max_pos_usd` ⇒ drop add side; both ⇒ reduce-only fallback) →
   ladder levels `1..N` via precomputed `SPREAD_FACTORS[l]=spread_factor_level1^l` →
   tick rounding.
 - `apply_quality_spread_multiplier` (1.0–1.5) and `apply_inventory_exit_bias`
@@ -301,7 +295,7 @@ poller every 3s (WS down) / 60s (WS up); orphan cancel via signed batch; pause a
 ### 5.10 `orchestrator` (cold)
 Startup: validate config → REST market details (ticks, mins) → build calculators →
 spawn Binance feeds (vol_obi engine) → signer create_client → cancel_all at startup →
-TxWebSocket connect → subscribe md/ticker/(trades for CJ) → (live) subscribe account
+TxWebSocket connect → subscribe md/ticker → (live) subscribe account
 channels + init fill accounting from account snapshot → wait for first book/account →
 optional panic-close → spawn background tasks (balance, sanity, watchdog, telemetry,
 reconciler, order_state_reconcile, paced_send) → run hot md loop → graceful shutdown
@@ -309,10 +303,10 @@ reconciler, order_state_reconcile, paced_send) → run hot md loop → graceful 
 
 ---
 
-## 6. Config — reuse `lighter_MM/config.json` verbatim
-Same keys/sections (`trading.{leverage,levels_per_side,base_amount,capital_usage_percent,
+## 6. Config — Rust live-engine subset of `lighter_MM/config.json`
+Same active keys/sections (`trading.{leverage,levels_per_side,base_amount,capital_usage_percent,
 default_quote_update_threshold_bps,spread_factor_level1,…,quote_engine,vol_obi{…},
-cartea_jaimungal{…},cj_estimator{…},alpha{…},live_quality{…},inventory_exit_bias{…}},
+alpha{…},live_quality{…},inventory_exit_bias{…}},
 performance{…}, websocket{…}, safety{…}`). serde structs with `#[serde(default)]`;
 env overrides (`MARKET_SYMBOL`, `API_KEY_*`, `ACCOUNT_INDEX`, `WALLET_ADDRESS`) via dotenvy.
 
@@ -331,8 +325,7 @@ env overrides (`MARKET_SYMBOL`, `API_KEY_*`, `ACCOUNT_INDEX`, `WALLET_ADDRESS`) 
 - **P3 — Account + safety:** account WS, fill_accounting, reconcile, risk, persistence,
   metrics, orchestrator. **Gate: live-shadow (order.enabled=false) parity vs Python.**
 - **P5 — Hardening:** Docker, README, soak test, latency benchmark (p50/p99 hot path),
-  + final codex reviews (overall correctness + hot/cold/latency/lock-free). (CJ engine
-  dropped — not in scope.)
+  + final codex reviews (overall correctness + hot/cold/latency/lock-free).
 
 Each gate: build (`cargo build --release`), `cargo clippy`, unit/parity tests, and a
 **GPT-5.5 (codex) review** of the diff before moving on.

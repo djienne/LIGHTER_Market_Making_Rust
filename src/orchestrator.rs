@@ -798,19 +798,10 @@ impl HotTask {
         };
         let num_levels = t.levels_per_side.max(1);
         let calc = VolObiCalculator::new(&cfg, market.price_tick, derived.max_pos_usd());
-        // Fallback reduce-only floor mirrors Python `max(CJ_MIN_HALF_SPREAD_BPS,
-        // VOL_OBI_MIN_HALF_SPREAD_BPS, 1.0)`. CJ alpha is dropped, but its min-half-spread is still
-        // used purely as a numeric spread FLOOR here (and in the live config it is the larger one),
-        // so we extract it from the otherwise-opaque cartea_jaimungal config value.
-        let cj_min_half_spread_bps = t
-            .cartea_jaimungal
-            .get("min_half_spread_bps")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
         Self {
             om: OrderManager::new(num_levels, market.amount_tick),
             factors: spread_factors(t.spread_factor_level1, num_levels),
-            fallback_bps: cj_min_half_spread_bps.max(vo.min_half_spread_bps).max(1.0),
+            fallback_bps: vo.min_half_spread_bps.max(1.0),
             min_loop_interval: config.performance.min_loop_interval,
             adverse_threshold_bps: t.live_quality.adverse_threshold_bps,
             quote_threshold_bps: t.default_quote_update_threshold_bps,

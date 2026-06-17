@@ -13,9 +13,7 @@ after warmup while maintaining four resting orders. Treat this as an environment
 observation, not a fixed guarantee.
 
 Strategy: **volatility + order-book-imbalance (OBI) alpha**, with an external Binance OBI feed —
-the same model as the live Python bot and the `standx` reference (and the hftbacktest
-"Market Making with Alpha — OBI" tutorial). There is **no Cartea-Jaimungal** (that code is
-deprecated/unused in the Python bot and is intentionally not ported).
+the same model as the live Python bot and the `standx` reference.
 
 See `PLAN.md` for the full design, the GPT-5.5 plan review, and module specs.
 
