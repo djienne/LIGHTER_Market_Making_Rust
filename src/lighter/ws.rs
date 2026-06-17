@@ -11,13 +11,19 @@ use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 pub const WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
+
+/// Proactive client-ping interval. Lighter closes any connection that sends NO frame for 2
+/// minutes (https://apidocs.lighter.xyz/docs/websocket-reference), so quiet streams (e.g.
+/// account/user_stats) must emit a keepalive frame well under that window — matches Python's
+/// `ping_interval=20`.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct SubscribeOptions {
@@ -125,6 +131,10 @@ where
     tracing::info!("{} subscribed to {:?}", opts.label, opts.channels);
 
     let recv_to = Duration::from_secs_f64(opts.recv_timeout);
+    let mut ping_tick = tokio::time::interval(WS_PING_INTERVAL);
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ping_tick.tick().await; // consume the immediate first tick (just connected)
+    let mut last_data = Instant::now();
     loop {
         // Non-blocking forced-reconnect check.
         if let Some(rc) = reconnect {
@@ -134,14 +144,30 @@ where
             }
         }
 
-        let msg = match timeout(recv_to, read.next()).await {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(e))) => return Err(e.into()),
-            Ok(None) => return Ok(()),
-            Err(_) => {
-                tracing::warn!("{} watchdog: no data for {}s", opts.label, opts.recv_timeout);
-                return Ok(());
+        // Race the read against the keepalive tick. On the tick we send a proactive client Ping
+        // (so a quiet stream still satisfies Lighter's 2-min "send a frame" rule) and enforce the
+        // dead-feed watchdog via `last_data` (the read itself has no timeout, so the ping cannot
+        // mask a stalled feed).
+        let msg = tokio::select! {
+            _ = ping_tick.tick() => {
+                // Dead-feed watchdog: trip on stale APPLICATION data (last_data is refreshed ONLY
+                // by real messages below — NOT by pings/pongs/subscribed — so the keepalive pings
+                // and their pong replies cannot mask a stalled feed). Check before pinging so we
+                // reconnect promptly rather than pinging a dead stream.
+                if last_data.elapsed() > recv_to {
+                    tracing::warn!("{} watchdog: no data for {}s", opts.label, opts.recv_timeout);
+                    return Ok(());
+                }
+                if write.send(Message::Ping(Vec::new())).await.is_err() {
+                    return Ok(()); // socket dead -> reconnect
+                }
+                continue;
             }
+            res = read.next() => match res {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => return Err(e.into()),
+                None => return Ok(()),
+            },
         };
 
         match msg {
@@ -152,12 +178,14 @@ where
                 };
                 match data.get("type").and_then(|v| v.as_str()) {
                     Some("ping") => {
+                        // Server app-level keepalive — reply, but do NOT count as feed data.
                         let _ = write.send(Message::Text(r#"{"type":"pong"}"#.to_string())).await;
                     }
                     Some("subscribed") => {}
                     _ => {
-                        // Isolate callback panics? We can't catch panics across FnMut easily
-                        // without UnwindSafe; callbacks here are written to not panic.
+                        // Real application message — this is the only thing that refreshes the
+                        // dead-feed watchdog. Callbacks here are written to not panic.
+                        last_data = Instant::now();
                         on_message(&data);
                     }
                 }
