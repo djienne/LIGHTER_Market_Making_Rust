@@ -15,6 +15,22 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<()> {
     lighter_mm::logging::init();
+    // Log panics through tracing (location + message) so a crash is visible in the bot log even
+    // though we unwind (release `panic = "unwind"`) rather than abort. The unwinding then resolves
+    // the panicking task's JoinHandle, letting `run()` perform the shutdown cancel-all.
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        tracing::error!("PANIC at {loc}: {msg}");
+    }));
     let _ = dotenvy::dotenv();
 
     let mut symbol: Option<String> = None;

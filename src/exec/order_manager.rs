@@ -24,6 +24,12 @@ pub struct OrderSlot {
     pub price: Option<f64>,
     pub size: Option<f64>,
     pub updated_at: Instant,
+    /// Consecutive reconcile snapshots in which this slot's order was MISSING. A slot is only
+    /// cleared after the order is absent for `MISSING_RECONCILE_DEBOUNCE` polls (plus the grace
+    /// window) — so a single stale/partial REST snapshot cannot false-clear a still-live order and
+    /// trigger a duplicate create (which would breach the hard ≤max_live cap). Reset to 0 whenever
+    /// the order is seen live / (re)bound.
+    miss: u32,
 }
 
 impl OrderSlot {
@@ -34,9 +40,14 @@ impl OrderSlot {
             price: None,
             size: None,
             updated_at: Instant::now(),
+            miss: 0,
         }
     }
 }
+
+/// Consecutive missing-from-snapshot polls before a tracked slot is cleared (codex: debounce a
+/// stale REST snapshot so it cannot false-clear a live order → recreate → >max_live).
+const MISSING_RECONCILE_DEBOUNCE: u32 = 2;
 
 pub struct OrderManager {
     num_levels: usize,
@@ -194,6 +205,32 @@ impl OrderManager {
         s.updated_at = Instant::now();
     }
 
+    /// Occupy a slot the MOMENT an op is emitted (before it is signed/sent), so the next
+    /// quote cycle's `collect_order_operations` never duplicates an in-flight order
+    /// (Python marks PLACING pre-send). For Create this binds the client id locally with
+    /// exchange_id still unknown (collect will skip modify/cancel until reconcile resolves it).
+    pub fn mark_pending(&mut self, op: &BatchOp) {
+        let s = self.slot_mut(op.side, op.level);
+        match op.action {
+            OrderAction::Create => {
+                s.order_id = Some(op.client_order_id);
+                s.price = Some(op.price);
+                s.size = Some(op.size);
+                s.status = SideStatus::Placing;
+            }
+            OrderAction::Modify => {
+                s.price = Some(op.price);
+                s.size = Some(op.size);
+                s.status = SideStatus::Modifying;
+            }
+            OrderAction::Cancel => {
+                s.status = SideStatus::Canceling;
+            }
+        }
+        s.updated_at = Instant::now();
+        s.miss = 0;
+    }
+
     fn bind_live(&mut self, side: Side, level: usize, order_id: i64, price: f64, size: f64) {
         let s = self.slot_mut(side, level);
         s.order_id = Some(order_id);
@@ -201,6 +238,7 @@ impl OrderManager {
         s.size = Some(size);
         s.status = SideStatus::Live;
         s.updated_at = Instant::now();
+        s.miss = 0;
     }
 
     fn clear_live(&mut self, side: Side, level: usize) {
@@ -282,15 +320,34 @@ impl OrderManager {
         let live_ids: std::collections::HashSet<i64> =
             remote.iter().filter(|o| o.is_live()).filter_map(|o| o.client_order_index).collect();
 
+        // Grace: a freshly-placed/bound order may not appear in a (possibly slightly stale)
+        // snapshot yet. Don't clear ANY slot updated within the grace window (regardless of
+        // Placing/Live), or a stale snapshot could reopen it and allow a duplicate create.
+        // A genuinely dead slot just lingers at most `grace` before the next snapshot clears it.
+        let grace = std::time::Duration::from_secs(5);
         for lvl in 0..self.num_levels {
-            if let Some(id) = self.bids[lvl].order_id {
-                if !live_ids.contains(&id) {
-                    self.clear_live(Side::Buy, lvl);
-                }
-            }
-            if let Some(id) = self.asks[lvl].order_id {
-                if !live_ids.contains(&id) {
-                    self.clear_live(Side::Sell, lvl);
+            for side in [Side::Buy, Side::Sell] {
+                let (id, aged) = {
+                    let s = self.slot(side, lvl);
+                    (s.order_id, s.updated_at.elapsed() >= grace)
+                };
+                let id = match id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                if live_ids.contains(&id) {
+                    // Seen live -> not missing; reset the debounce counter.
+                    self.slot_mut(side, lvl).miss = 0;
+                } else {
+                    // Missing from THIS snapshot. Only clear after it has been missing for
+                    // MISSING_RECONCILE_DEBOUNCE consecutive snapshots AND the grace window — a
+                    // single stale/partial REST snapshot must not false-clear a live order (which
+                    // would let the hot task recreate it -> two live orders -> breach ≤max_live).
+                    let m = self.slot(side, lvl).miss + 1;
+                    self.slot_mut(side, lvl).miss = m;
+                    if m >= MISSING_RECONCILE_DEBOUNCE && aged {
+                        self.clear_live(side, lvl);
+                    }
                 }
             }
         }

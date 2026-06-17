@@ -63,7 +63,11 @@ dotenvy = "0.15"
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# `unwind` (not `abort`): a panic in the hot task / sender then unwinds that task and resolves
+# its JoinHandle (Err) instead of nuking the whole process — so `run()` always reaches the
+# shutdown cancel-all and never leaves live orders resting on a crash. The hot path has no
+# panics in steady state, so the codegen cost over `abort` is negligible for this workload.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1

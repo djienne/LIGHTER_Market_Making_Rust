@@ -48,11 +48,22 @@ impl TxWebSocket {
         Ok(ws)
     }
 
+    /// Extract a message field as its RAW string content. For a JSON string this returns the
+    /// inner text (so an empty message `""` becomes the empty Rust string, NOT `"\"\""`) — the
+    /// reject classifier and the empty-message code-fallback depend on this (codex).
+    fn extract_message(v: Option<&Value>) -> String {
+        match v {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) if !other.is_null() => other.to_string(),
+            _ => String::new(),
+        }
+    }
+
     fn code_message(resp: &Value) -> (i64, String) {
         if let Some(err) = resp.get("error") {
             if let Some(obj) = err.as_object() {
                 let code = obj.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                let msg = obj.get("message").map(|m| m.to_string()).unwrap_or_default();
+                let msg = Self::extract_message(obj.get("message"));
                 return (if code == 200 { 0 } else { code }, msg);
             } else if !err.is_null() {
                 return (-1, err.to_string());
@@ -63,7 +74,7 @@ impl TxWebSocket {
             .or_else(|| resp.get("status_code"))
             .and_then(|c| c.as_i64())
             .unwrap_or(0);
-        let msg = resp.get("message").map(|m| m.to_string()).unwrap_or_default();
+        let msg = Self::extract_message(resp.get("message"));
         (if code == 200 { 0 } else { code }, msg)
     }
 

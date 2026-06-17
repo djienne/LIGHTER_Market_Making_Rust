@@ -33,6 +33,9 @@ impl BinanceObi {
         self.imb_stats.clear();
         self.last_update_id = 0;
         self.prev_u = 0;
+        // Also clear the published alpha so a stale OBI value cannot leak across a reconnect /
+        // re-snapshot (Python `BinanceDiffDepthClient._reset` calls `SharedAlpha.reset`).
+        self.shared.reset();
     }
 
     pub fn last_update_id(&self) -> i64 {

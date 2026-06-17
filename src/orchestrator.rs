@@ -9,13 +9,12 @@
 
 use crate::book::local_book::LocalBook;
 use crate::config::{Config, Credentials};
+use crate::exec::instance_lock::InstanceLock;
 use crate::exec::order_manager::OrderManager;
 use crate::exec::paced_send::{self, SenderCtx};
 use crate::exec::rate_limit::RateLimiter;
 use crate::lighter::auth::generate_ws_auth_token;
-use crate::lighter::messages::{
-    AccountAllMsg, AccountOrdersMsg, OrderBookMsg, RemoteOrder, TickerMsg, UserStatsMsg,
-};
+use crate::lighter::messages::{AccountAllMsg, OrderBookMsg, RemoteOrder, TickerMsg, UserStatsMsg};
 use crate::lighter::nonce::NonceManager;
 use crate::lighter::rest::{RestClient, BASE_URL};
 use crate::lighter::signer::Signer;
@@ -24,21 +23,28 @@ use crate::lighter::ws::{subscribe_loop, subscribe_loop_authed, SubscribeOptions
 use crate::risk::RiskController;
 use crate::shared::{Derived, SharedAlpha, SharedBbo, SharedPosition};
 use crate::strategy::quotes::{
-    apply_inventory_exit_bias, apply_quality_spread_multiplier, build_quote_levels, spread_factors,
+    apply_inventory_exit_bias, apply_quality_spread_multiplier, build_quote_levels,
+    fallback_reduce_only, normalize_live_order_size, spread_factors,
 };
 use crate::strategy::vol_obi::{VolObiCalculator, VolObiConfig};
 use crate::types::{BatchOp, MarketConfig, OrderEvent};
 use crate::util::dynamic_max_position;
 use anyhow::{Context, Result};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use parking_lot::Mutex as PMutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, watch, Notify};
 
 type ReconcileSwap = Arc<ArcSwapOption<Vec<RemoteOrder>>>;
+/// Client order-ids the hot task currently tracks, published for the reconcile poller's
+/// orphan detection.
+type TrackedIds = Arc<ArcSwap<Vec<i64>>>;
+/// Set by shutdown to stop the sender placing new orders before cancel-all.
+type Halt = Arc<AtomicBool>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -53,6 +59,18 @@ pub struct App {
     pub creds: Credentials,
     pub market: MarketConfig,
     pub rest: Arc<RestClient>,
+}
+
+/// Live cold-path handles returned to `run()` so it can (a) hold the single-instance lock for
+/// the process lifetime, (b) serialize the shutdown cancel-all on the nonce, and (c) watch the
+/// critical tasks so an unexpected death triggers a clean cancel-all instead of leaving orders.
+struct LiveDeps {
+    signer: Arc<Signer>,
+    nonce: Arc<NonceManager>,
+    sdk_lock: Arc<tokio::sync::Mutex<()>>,
+    sender: tokio::task::JoinHandle<()>,
+    /// Held (not used) for the process lifetime; releasing it frees the per-account flock.
+    _instance_lock: InstanceLock,
 }
 
 impl App {
@@ -98,8 +116,9 @@ impl App {
             self.market.min_base_amount.max(0.00001)
         };
         derived.set_base_amount(base_amount);
-        // Shadow: no capital feed -> effectively unlimited so quoting is exercised.
-        derived.set_max_pos_usd(1.0e12);
+        // Live: seed 0 so we NEVER quote before capital+position feeds arrive (codex #7).
+        // Shadow: effectively unlimited so the pipeline is exercised without account feeds.
+        derived.set_max_pos_usd(if mode == Mode::Live { 0.0 } else { 1.0e12 });
 
         // --- Binance alpha feeds (cold) ---
         if self.config.trading.alpha.source.eq_ignore_ascii_case("binance") {
@@ -122,11 +141,20 @@ impl App {
         let (ops_tx, ops_rx) = watch::channel::<Vec<BatchOp>>(Vec::new());
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<OrderEvent>();
         let reconcile_swap: ReconcileSwap = Arc::new(ArcSwapOption::empty());
+        let tracked_ids: TrackedIds = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let halt: Halt = Arc::new(AtomicBool::new(false));
 
-        if mode == Mode::Live {
-            self.spawn_live_cold_tasks(shared_pos.clone(), derived.clone(), ops_rx, evt_tx, reconcile_swap.clone())
-                .await?;
-        }
+        let mut live_deps = if mode == Mode::Live {
+            Some(
+                self.spawn_live_cold_tasks(
+                    shared_pos.clone(), derived.clone(), ops_rx, evt_tx, reconcile_swap.clone(),
+                    tracked_ids.clone(), halt.clone(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         // --- HOT market-data task (owns book + signal + order state) ---
         let hot = HotTask::new(
@@ -139,13 +167,45 @@ impl App {
             ops_tx,
             evt_rx,
             reconcile_swap,
+            tracked_ids,
             mode,
         );
-        let md_handle = tokio::spawn(hot.run(self.config.clone(), self.market.clone()));
+        let mut md_handle = tokio::spawn(hot.run(self.config.clone(), self.market.clone()));
 
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("shutdown signal received");
+        // Wait for a shutdown signal OR for a critical task to die unexpectedly. With
+        // `panic = "unwind"` (release profile) a panic in the hot task or sender unwinds that
+        // task and resolves its JoinHandle (Err on panic) instead of aborting the process — so
+        // we always reach the cancel-all path below and never leave orders resting on a crash.
+        if let Some(deps) = live_deps.as_mut() {
+            tokio::select! {
+                _ = wait_for_shutdown() => tracing::info!("shutdown signal received"),
+                r = &mut md_handle => tracing::error!("HOT (market-data) task exited unexpectedly ({r:?}); shutting down"),
+                r = &mut deps.sender => tracing::error!("paced sender task exited unexpectedly ({r:?}); shutting down"),
+            }
+        } else {
+            tokio::select! {
+                _ = wait_for_shutdown() => tracing::info!("shutdown signal received"),
+                r = &mut md_handle => tracing::error!("HOT (market-data) task exited unexpectedly ({r:?}); shutting down"),
+            }
+        }
+
+        // SAFETY shutdown: stop placing NEW orders, drain any in-flight send, then verify flat.
+        halt.store(true, Ordering::SeqCst);
         md_handle.abort();
+        if let Some(deps) = live_deps {
+            // Acquire sdk_lock BEFORE aborting the sender: this WAITS for any in-flight send_once
+            // to finish its outcome handling and RELEASE the lock. Aborting it mid-send could let
+            // a tx land on the exchange AFTER our cancel-all verified zero — a resting orphan
+            // post-exit (codex). With `halt` set, once the sender releases the lock it will not
+            // start another send, so it is safe to stop it now and then verify a flat book.
+            let _g = deps.sdk_lock.lock().await;
+            deps.sender.abort();
+            cancel_all_and_verify(
+                &deps.signer, &deps.nonce, &self.rest, self.creds.api_key_index,
+                self.creds.account_index, self.market.market_id,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -158,13 +218,29 @@ impl App {
         ops_rx: watch::Receiver<Vec<BatchOp>>,
         evt_tx: mpsc::UnboundedSender<OrderEvent>,
         reconcile_swap: ReconcileSwap,
-    ) -> Result<()> {
+        tracked_ids: TrackedIds,
+        halt: Halt,
+    ) -> Result<LiveDeps> {
         let aki = self.creds.api_key_index;
         let acct = self.creds.account_index;
         let mkt_id = self.market.market_id;
         if self.creds.api_key_private_key.is_empty() {
             anyhow::bail!("LIVE mode requires API_KEY_PRIVATE_KEY in .env");
         }
+
+        // SAFETY (single-instance): acquire the per-(account, api-key) lock BEFORE touching the
+        // nonce or placing any order. Two bots on the same pair share one exchange nonce sequence
+        // and would corrupt each other ('invalid nonce' cascade) + double-place orders — the
+        // dominant failure of the first smoke test (two Rust instances ran at once).
+        let instance_lock = InstanceLock::acquire(acct, aki)?;
+        // The flock only guards same-host processes; a containerized bot with the same creds is
+        // invisible to it. Make the operator rule explicit and loud.
+        tracing::warn!(
+            "LIVE single-instance lock held for account_index={acct} api_key_index={aki}. \
+             Do NOT run any other bot (e.g. the production `lighter-mm` docker container or the \
+             Python market_maker_v2) on these SAME credentials concurrently — they share one \
+             nonce sequence and will collide."
+        );
         let signers_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("signers");
         let signer = Arc::new(Signer::load(
             &signers_dir, BASE_URL, &self.creds.api_key_private_key, aki, acct,
@@ -172,6 +248,11 @@ impl App {
         let nonce = Arc::new(NonceManager::init(&self.rest, acct, aki).await?);
         let tx_ws = Arc::new(TxWebSocket::new(WS_URL));
         let _ = tx_ws.connect().await;
+
+        // SAFETY: clear any pre-existing orders AND verify a flat book before enabling sending.
+        if !cancel_all_and_verify(&signer, &nonce, &self.rest, aki, acct, mkt_id).await {
+            anyhow::bail!("startup: could not verify a flat order book; aborting LIVE start");
+        }
         let rate = RateLimiter::new(
             self.config.trading.default_quote_update_threshold_bps,
             self.config.performance.rate_limit_send_interval,
@@ -182,51 +263,37 @@ impl App {
         )));
         let reconcile_notify = Arc::new(Notify::new());
         let sdk_lock = Arc::new(tokio::sync::Mutex::new(()));
+        // Nonce-trust flag: set false if a mandatory hard_refresh exhausts retries; the sender then
+        // refuses new orders and the reconcile poller re-syncs the nonce + clears it (codex).
+        let nonce_ok = Arc::new(AtomicBool::new(true));
         let recv_to = self.config.websocket.account_recv_timeout;
 
-        // Paced sender (mailbox -> rate gate -> sign -> send).
-        tokio::spawn(paced_send::run(
+        // Paced sender (mailbox -> rate gate -> sign -> send). Handle is watched by `run()` so a
+        // sender death triggers a clean cancel-all shutdown.
+        let sender = tokio::spawn(paced_send::run(
             SenderCtx {
                 signer: signer.clone(),
                 nonce: nonce.clone(),
                 rest: self.rest.clone(),
                 tx_ws: tx_ws.clone(),
                 market: self.market.clone(),
+                account_index: acct,
                 derived: derived.clone(),
                 risk: risk.clone(),
                 reconcile: reconcile_notify.clone(),
                 sdk_lock: sdk_lock.clone(),
                 events: evt_tx.clone(),
+                halt: halt.clone(),
+                nonce_ok: nonce_ok.clone(),
             },
             rate,
             ops_rx,
         ));
 
-        // account_orders -> reconcile snapshot (drives bind/clear in the hot task).
-        {
-            let rsw = reconcile_swap.clone();
-            let sgn = signer.clone();
-            let ch = format!("account_orders/{}/{}", mkt_id, acct);
-            let ch_auth = ch.clone();
-            let mut opts = SubscribeOptions::new("account_orders", vec![ch]);
-            opts.recv_timeout = recv_to;
-            tokio::spawn(async move {
-                subscribe_loop_authed(
-                    opts,
-                    move || auth_map(&sgn, aki, &ch_auth),
-                    move |data| {
-                        if let Ok(msg) = serde_json::from_value::<AccountOrdersMsg>(data.clone()) {
-                            let mut all = Vec::new();
-                            for (_k, v) in msg.orders {
-                                all.extend(v);
-                            }
-                            rsw.store(Some(Arc::new(all)));
-                        }
-                    },
-                )
-                .await;
-            });
-        }
+        // NOTE: order-state reconciliation is driven ONLY by the REST stale-poller below,
+        // which returns FULL active-order snapshots (correct for process_reconcile). The
+        // account_orders WS sends INCREMENTAL deltas that must NOT go through full reconcile
+        // (codex #1: would clear real resting orders and cause duplicates), so it is not wired.
 
         // account_all -> position (atomic, lock-free read in hot path).
         {
@@ -277,31 +344,241 @@ impl App {
             });
         }
 
-        // REST reconcile stale-poller (correctness backstop; also fires on unknown-outcome).
+        // REST reconcile stale-poller: full active-order snapshots drive process_reconcile, and
+        // it enforces safety — cancels orphan exchange orders (codex #2) and caps live count.
         {
             let rsw = reconcile_swap.clone();
             let sgn = signer.clone();
+            let nm = nonce.clone();
             let rest = self.rest.clone();
             let notify = reconcile_notify.clone();
+            let tids = tracked_ids.clone();
+            let sdk = sdk_lock.clone();
+            let sp = shared_pos.clone();
+            let rsk = risk.clone();
+            let nok = nonce_ok.clone();
             let interval = self.config.safety.stale_order_poller_interval_sec.max(1.0);
+            let max_live = self.config.safety.max_live_orders_per_market.max(1);
+            // Consecutive reconcile-mismatch polls before the circuit breaker arms a cooldown pause
+            // (Python `STALE_ORDER_DEBOUNCE_COUNT`, floored at 1).
+            let debounce_min = self.config.safety.stale_order_debounce_count.max(1) as u32;
             tokio::spawn(async move {
+                // Arm a cooldown pause once reconcile mismatches persist past the debounce
+                // (Python L2496-2499). Called under one lock right after a not-ok mark_reconcile.
+                let pause_if_streak = |reason: &str| {
+                    let mut r = rsk.lock();
+                    let streak = r.mismatch_streak();
+                    if streak >= debounce_min {
+                        r.trigger_pause(&format!("reconcile mismatch ({reason}) streak={streak}"));
+                    }
+                };
+                let mut prev_orphans: HashSet<i64> = HashSet::new();
                 loop {
                     tokio::select! {
                         _ = notify.notified() => {}
                         _ = tokio::time::sleep(std::time::Duration::from_secs_f64(interval)) => {}
                     }
-                    if let Ok(tok) = generate_ws_auth_token(&sgn, aki) {
-                        if let Ok(orders) = rest.account_active_orders(acct, mkt_id, &tok).await {
-                            rsw.store(Some(Arc::new(orders)));
+                    let tok = match generate_ws_auth_token(&sgn, aki) {
+                        Ok(t) => t,
+                        // A failed reconcile must BLOCK pause-recovery (Python mark_reconcile(ok=False))
+                        // and, once it persists past the debounce, arm the cooldown pause.
+                        Err(_) => {
+                            rsk.lock().mark_reconcile(false, "auth_token");
+                            pause_if_streak("auth_token");
+                            continue;
+                        }
+                    };
+                    let orders = match rest.account_active_orders(acct, mkt_id, &tok).await {
+                        Ok(o) => o,
+                        Err(_) => {
+                            rsk.lock().mark_reconcile(false, "rest_active_orders");
+                            pause_if_streak("rest_active_orders");
+                            continue;
+                        }
+                    };
+
+                    // Record reconcile HEALTH synchronously, the instant the snapshot is in hand —
+                    // BEFORE rsw.store and BEFORE any `.await` (codex TOCTOU): otherwise a paused
+                    // sender could recover on the previous `last_reconcile_ok=true` during the
+                    // position-fetch await while an orphan/over-cap snapshot is already known, then
+                    // place a full tracked set on top → exceeding the hard ≤max_live cap.
+                    // A snapshot is CLEAN only if it is in-bounds AND has NO untracked (orphan) orders.
+                    let tracked: HashSet<i64> = tids.load().iter().copied().collect();
+                    let now_orphans: HashSet<i64> = orders
+                        .iter()
+                        .filter_map(|o| o.client_order_index)
+                        .filter(|cid| !tracked.contains(cid))
+                        .collect();
+                    let over_cap = orders.len() > max_live;
+                    if over_cap {
+                        // Hard desync — arm the cooldown pause directly (Python L2390-2396) so
+                        // trading does not resume the instant the cancel-all below clears the book.
+                        let mut r = rsk.lock();
+                        r.mark_reconcile(false, "too_many_orders");
+                        r.trigger_pause(&format!("exchange has {} live orders (> {})", orders.len(), max_live));
+                    } else if now_orphans.is_empty() {
+                        rsk.lock().mark_reconcile(true, "poll_ok");
+                    } else {
+                        rsk.lock().mark_reconcile(false, "orphans_present");
+                        pause_if_streak("orphans_present");
+                    }
+
+                    // Full snapshot -> hot task refreshes/clears tracked slots.
+                    rsw.store(Some(Arc::new(orders.clone())));
+                    // Authoritative position via REST (never stale even if account WS dies).
+                    if let Ok(pos) = rest.account_position(acct, mkt_id).await {
+                        sp.set(pos);
+                    }
+
+                    // SAFETY: too many live orders => something desynced; cancel-all + keep pause parked.
+                    if over_cap {
+                        tracing::error!("SAFETY: {} active orders > max {} -> cancel-all", orders.len(), max_live);
+                        let _g = sdk.lock().await; // serialize nonce use with the sender
+                        let _ = cancel_all_and_verify(&sgn, &nm, &rest, aki, acct, mkt_id).await;
+                        prev_orphans.clear();
+                        continue;
+                    }
+
+                    // If the nonce is untrusted (a prior mandatory refresh failed), REST is clearly
+                    // reachable now (we just fetched orders), so re-sync it under sdk_lock and clear
+                    // the flag — resume must never fire a batch with a known-bad nonce (codex).
+                    if !nok.load(Ordering::SeqCst) {
+                        let _g = sdk.lock().await;
+                        if nm.hard_refresh(&rest).await.is_ok() {
+                            nok.store(true, Ordering::SeqCst);
+                            tracing::info!("nonce re-synced by reconcile poller; resume unblocked");
                         }
                     }
+
+                    // Cancel orphans, but only after TWO consecutive polls (debounce vs the
+                    // create->appear race). Runs even while paused (mirrors Python; an orphan is an
+                    // extra resting order). sdk.lock() serializes nonce use with the sender.
+                    for o in &orders {
+                        if let Some(cid) = o.client_order_index {
+                            if !tracked.contains(&cid) && prev_orphans.contains(&cid) {
+                                if let Some(eid) = o.order_index {
+                                    let _g = sdk.lock().await;
+                                    let n = nm.next();
+                                    match sgn.sign_cancel_order(mkt_id as i32, eid, n, aki) {
+                                        Ok(tx) => match rest.send_tx(tx.tx_type, &tx.tx_info).await {
+                                            Ok(r) if r.code == 0 || r.code == 200 => {
+                                                tracing::warn!("cancelled orphan client_id={cid} exch={eid}");
+                                            }
+                                            Ok(r) => {
+                                                tracing::warn!("orphan cancel rejected code={} msg={}", r.code, r.message);
+                                                if nm.hard_refresh(&rest).await.is_err() {
+                                                    nok.store(false, Ordering::SeqCst);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("orphan cancel send err: {e}");
+                                                if nm.hard_refresh(&rest).await.is_err() {
+                                                    nok.store(false, Ordering::SeqCst);
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            nm.acknowledge_failure();
+                                            tracing::warn!("orphan cancel sign failed: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    prev_orphans = now_orphans;
                 }
             });
         }
 
         tracing::warn!("LIVE mode: order sending ENABLED for {} (market_id={})", self.market.symbol, mkt_id);
-        Ok(())
+        Ok(LiveDeps {
+            signer,
+            nonce,
+            sdk_lock,
+            sender,
+            _instance_lock: instance_lock,
+        })
     }
+}
+
+/// Sign + send an immediate cancel-all (used at startup and on shutdown for a clean book).
+async fn cancel_all_orders(
+    signer: &Signer,
+    nonce: &NonceManager,
+    rest: &RestClient,
+    aki: i32,
+) -> Result<()> {
+    // IMMEDIATE cancel-all requires a nil time (the signer rejects a real timestamp with
+    // "CancelAllTime should be nil"); Python passes timestamp_ms=0.
+    let ts = 0i64;
+    let n = nonce.next();
+    let tx = match signer.sign_cancel_all_orders(crate::lighter::signer::CANCEL_ALL_TIF_IMMEDIATE, ts, n, aki) {
+        Ok(t) => t,
+        Err(e) => {
+            nonce.acknowledge_failure();
+            return Err(e);
+        }
+    };
+    let resp = rest.send_tx(tx.tx_type, &tx.tx_info).await?;
+    if resp.code != 0 && resp.code != 200 {
+        anyhow::bail!("cancel-all rejected: code={} msg={}", resp.code, resp.message);
+    }
+    tracing::info!("cancel-all OK (code={})", resp.code);
+    Ok(())
+}
+
+/// Wait for SIGINT or SIGTERM (so service stop also triggers the clean shutdown path).
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) {
+            (Ok(mut sigint), Ok(mut sigterm)) => {
+                tokio::select! { _ = sigint.recv() => {}, _ = sigterm.recv() => {} }
+            }
+            _ => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Cancel-all on shutdown, retrying with nonce refresh, then REST-verify zero active orders
+/// before returning (codex #5). Logs loudly if it cannot confirm a flat book.
+/// Cancel-all, retrying with nonce refresh, then REST-verify zero active orders. Returns true
+/// only if a flat book was confirmed. Used both at startup (abort live if false) and shutdown.
+pub(crate) async fn cancel_all_and_verify(
+    signer: &Signer,
+    nonce: &NonceManager,
+    rest: &RestClient,
+    aki: i32,
+    acct: i64,
+    market_id: u32,
+) -> bool {
+    tracing::info!("cancelling all orders and verifying flat...");
+    for attempt in 1..=5 {
+        if let Err(e) = cancel_all_orders(signer, nonce, rest, aki).await {
+            tracing::error!("cancel-all attempt {attempt}: {e}");
+            let _ = nonce.hard_refresh(rest).await;
+        }
+        if let Ok(tok) = generate_ws_auth_token(signer, aki) {
+            if let Ok(orders) = rest.account_active_orders(acct, market_id, &tok).await {
+                if orders.is_empty() {
+                    tracing::info!("verified 0 active orders");
+                    return true;
+                }
+                tracing::warn!("{} orders still active after attempt {attempt}", orders.len());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    }
+    tracing::error!("WARNING: could NOT verify zero active orders — CHECK MANUALLY");
+    false
 }
 
 /// One-shot channel->token map for an authed subscription.
@@ -326,13 +603,30 @@ struct HotTask {
     fallback_bps: f64,
     min_loop_interval: f64,
     adverse_threshold_bps: f64,
+    /// Base requote threshold (bps) from config; widened under quota pressure each cycle
+    /// (Python `_adaptive_threshold_bps`). A modify is suppressed unless the price moves more.
+    quote_threshold_bps: f64,
     inv_bias: crate::config::InventoryExitBias,
+    /// Per-order size as a fraction of capital (Python `CAPITAL_USAGE_PERCENT`); drives the
+    /// capital-derived dynamic base size in live mode.
+    capital_usage_percent: f64,
+    /// Minimum order value (USD) for quota generation; folds into the size min-quote floor.
+    min_order_value_usd: f64,
+    /// Wall-clock warmup: suppress ALL quoting for this many seconds after start (Python
+    /// `WARMUP_SECONDS`), except a reduce-only exit if already holding inventory.
+    warmup_seconds: f64,
+    /// Set on the first book tick; the warmup window is measured from here.
+    loop_start: Option<Instant>,
+    /// Set true by the market-data WS `on_disconnect`; the next tick discards the stale book +
+    /// vol/OBI state (Python resets the calc on DISCONNECT, not on in-connection snapshots).
+    reset_flag: Arc<AtomicBool>,
     shared_alpha: Arc<SharedAlpha>,
     shared_pos: Arc<SharedPosition>,
     derived: Arc<Derived>,
     ops_tx: watch::Sender<Vec<BatchOp>>,
     evt_rx: mpsc::UnboundedReceiver<OrderEvent>,
     reconcile_swap: ReconcileSwap,
+    tracked_ids: TrackedIds,
     leverage: i32,
     mode: Mode,
     last_quote: Option<Instant>,
@@ -351,6 +645,7 @@ impl HotTask {
         ops_tx: watch::Sender<Vec<BatchOp>>,
         evt_rx: mpsc::UnboundedReceiver<OrderEvent>,
         reconcile_swap: ReconcileSwap,
+        tracked_ids: TrackedIds,
         mode: Mode,
     ) -> Self {
         let t = &config.trading;
@@ -368,13 +663,28 @@ impl HotTask {
         };
         let num_levels = t.levels_per_side.max(1);
         let calc = VolObiCalculator::new(&cfg, market.price_tick, derived.max_pos_usd());
+        // Fallback reduce-only floor mirrors Python `max(CJ_MIN_HALF_SPREAD_BPS,
+        // VOL_OBI_MIN_HALF_SPREAD_BPS, 1.0)`. CJ alpha is dropped, but its min-half-spread is still
+        // used purely as a numeric spread FLOOR here (and in the live config it is the larger one),
+        // so we extract it from the otherwise-opaque cartea_jaimungal config value.
+        let cj_min_half_spread_bps = t
+            .cartea_jaimungal
+            .get("min_half_spread_bps")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         Self {
             om: OrderManager::new(num_levels, market.amount_tick),
             factors: spread_factors(t.spread_factor_level1, num_levels),
-            fallback_bps: vo.min_half_spread_bps.max(1.0),
+            fallback_bps: cj_min_half_spread_bps.max(vo.min_half_spread_bps).max(1.0),
             min_loop_interval: config.performance.min_loop_interval,
             adverse_threshold_bps: t.live_quality.adverse_threshold_bps,
+            quote_threshold_bps: t.default_quote_update_threshold_bps,
             inv_bias: t.inventory_exit_bias.clone(),
+            capital_usage_percent: t.capital_usage_percent,
+            min_order_value_usd: t.min_order_value_usd,
+            warmup_seconds: vo.warmup_seconds,
+            loop_start: None,
+            reset_flag: Arc::new(AtomicBool::new(false)),
             alpha_stale_ms: (t.alpha.stale_seconds * 1000.0) as u64,
             market,
             book: LocalBook::new(),
@@ -387,6 +697,7 @@ impl HotTask {
             ops_tx,
             evt_rx,
             reconcile_swap,
+            tracked_ids,
             leverage: t.leverage,
             mode,
             last_quote: None,
@@ -404,13 +715,19 @@ impl HotTask {
         opts.reconnect_base = config.websocket.reconnect_base_delay;
         opts.reconnect_max = config.websocket.reconnect_max_delay;
 
+        // Start the wall-clock warmup window now (Python `_loop_start_time` at loop start).
+        self.loop_start = Some(Instant::now());
+        // on_disconnect flag (set from a separate closure that cannot borrow `self`): the next
+        // tick discards stale book + vol/OBI state. Mirrors Python resetting the calc on DISCONNECT.
+        let reset_flag = self.reset_flag.clone();
+
         // The subscribe callback IS the synchronous hot path.
         subscribe_loop(
             opts,
             None,
             |data| self.on_message(data),
-            || {
-                // on_disconnect: reset book + vol state (matches Python).
+            move || {
+                reset_flag.store(true, Ordering::SeqCst);
             },
         )
         .await;
@@ -429,6 +746,13 @@ impl HotTask {
     }
 
     fn on_orderbook(&mut self, msg: OrderBookMsg) {
+        // WS reconnected since the last tick — discard stale book + vol/OBI state so the upcoming
+        // snapshot is treated as a fresh (re)initialization (Python resets the calc on DISCONNECT).
+        if self.reset_flag.swap(false, Ordering::SeqCst) {
+            self.book = LocalBook::new();
+            self.calc.reset();
+        }
+
         // Offset stale-guard for deltas.
         let offset = msg.effective_offset();
         let is_snapshot = msg.is_snapshot();
@@ -441,15 +765,25 @@ impl HotTask {
         }
         let bids: Vec<(f64, f64)> = msg.order_book.bids.iter().map(|l| l.parsed()).collect();
         let asks: Vec<(f64, f64)> = msg.order_book.asks.iter().map(|l| l.parsed()).collect();
+        // Reset the vol/OBI calc ONLY on the FIRST snapshot of a connection (book not yet
+        // initialized) — NOT on in-connection server snapshot refreshes, which would wipe the
+        // accumulated volatility/OBI windows and re-trigger warmup (codex/audit: Python preserves
+        // calc state across in-connection snapshots and resets only on disconnect, handled above).
         if is_snapshot || !self.book.initialized {
+            let was_initialized = self.book.initialized;
             self.book.apply_snapshot(bids, asks);
-            self.calc.reset();
+            if !was_initialized {
+                self.calc.reset();
+            }
         } else {
             self.book.apply_delta(&bids, &asks);
         }
         if let Some(off) = offset {
             self.book.last_offset = Some(off);
         }
+
+        // Stamp market-data freshness (read by the sender as a WS-health proxy for pause recovery).
+        self.derived.set_md_now();
 
         // Hot signal update.
         if let Some(mid) = self.book.mid() {
@@ -482,15 +816,36 @@ impl HotTask {
         let ov = self.shared_alpha.usable_alpha(self.alpha_stale_ms);
         self.calc.set_alpha_override(ov);
 
-        if !self.calc.warmed_up() {
+        // Live feed-readiness gate (codex #7): never quote before capital + position snapshots
+        // have arrived, so we never quote (or decide reduce-only) on a stale/zero position. This
+        // runs BEFORE the warmup/warmed checks so the reduce-only-during-warmup bypass below has a
+        // trustworthy position.
+        if self.mode == Mode::Live
+            && (self.derived.capital() <= 0.0 || self.shared_pos.age_ms() == u64::MAX)
+        {
+            let _ = self.ops_tx.send(Vec::new());
             return;
         }
         let mid = self.mid;
         let position = self.shared_pos.get();
-        // Recompute the position limit from live capital (user_stats) + current mid.
         let capital = self.derived.capital();
+        let tick = self.market.price_tick;
+
+        // Capital-derived dynamic order size (Python `calculate_dynamic_base_amount`): a fixed
+        // fraction of capital * leverage / mid, normalized to exchange minimums. Falls back to the
+        // static seed when capital is unknown (shadow). `capital_usage_percent` was dead config.
+        let order_size = if capital > 0.0 {
+            let raw = capital * self.capital_usage_percent * (self.leverage as f64) / mid;
+            let min_quote = self.market.min_quote_amount.max(self.min_order_value_usd);
+            normalize_live_order_size(raw, mid, self.market.amount_tick, self.market.min_base_amount, min_quote)
+        } else {
+            self.base_amount
+        };
+
+        // Position limit from live capital + the ACTUAL (dynamic) order size (margin reserved for
+        // the resting ladder scales with the real clip size).
         let max_pos_usd = if capital > 0.0 {
-            let mp = dynamic_max_position(mid, capital, self.leverage, self.base_amount, self.num_levels as i32);
+            let mp = dynamic_max_position(mid, capital, self.leverage, order_size, self.num_levels as i32);
             self.derived.set_max_pos_usd(mp);
             mp
         } else {
@@ -498,37 +853,71 @@ impl HotTask {
         };
         self.calc.set_max_position_dollar(max_pos_usd);
 
-        let l0 = self.calc.quote(mid, position);
-        let mut levels = build_quote_levels(
-            l0, mid, position, max_pos_usd, self.market.price_tick, self.num_levels, &self.factors,
-            self.fallback_bps,
-        );
-        // Quality multiplier + inventory exit bias (adverse_bps=0 without live metrics in shadow).
-        levels = apply_quality_spread_multiplier(&levels, mid, 1.0, self.market.price_tick);
-        levels = apply_inventory_exit_bias(
-            &levels, mid, position, max_pos_usd, 0.0, self.adverse_threshold_bps, &self.inv_bias,
-            self.market.price_tick,
+        let now_ns = crate::shared::now_ms() as i64 * 1_000_000;
+        // Requote threshold: config base, widened under quota pressure (Python _adaptive_threshold_bps).
+        // A resting order is only modified when the price moves more than this — sub-threshold ticks
+        // are skipped (matches the Python; conserves quota, which is why it scales with quota).
+        let threshold_bps = crate::exec::rate_limit::quota_adaptive_threshold_bps(
+            self.quote_threshold_bps,
+            self.derived.quota(),
         );
 
-        let now_ns = crate::shared::now_ms() as i64 * 1_000_000;
-        let ops = self.om.collect_order_operations(&levels, self.base_amount, position, 8.0, now_ns);
+        // NOT READY for normal quoting if EITHER the count-based vol/OBI warmup is incomplete
+        // (`!calc.warmed_up()`) OR we are inside the MANDATORY wall-clock warmup window (Python
+        // `WARMUP_SECONDS`, live only). In both cases we suppress normal quotes but STILL emit a
+        // passive reduce-only exit if we hold inventory (Python: reduce-only bypass works even
+        // before the calc is warmed, since the exit is a fixed-bps fallback that needs no vol/OBI).
+        // Shadow has no wall-clock warmup so it stays a fast verification tool.
+        let in_wallclock_warmup = self.mode == Mode::Live
+            && self.loop_start.map(|s| s.elapsed().as_secs_f64() < self.warmup_seconds).unwrap_or(true);
+        let not_ready = !self.calc.warmed_up() || in_wallclock_warmup;
+
+        let levels = if not_ready {
+            if position.abs() >= crate::strategy::quotes::EPSILON {
+                // Holding inventory while not ready -> quote only a passive reduce-only exit.
+                fallback_reduce_only(mid, position, tick, self.fallback_bps, self.num_levels)
+            } else {
+                // Flat and not ready -> no quotes at all.
+                let _ = self.ops_tx.send(Vec::new());
+                return;
+            }
+        } else {
+            let l0 = self.calc.quote(mid, position);
+            let mut lv = build_quote_levels(
+                l0, mid, position, max_pos_usd, tick, self.num_levels, &self.factors, self.fallback_bps,
+            );
+            // Quality multiplier + inventory-exit bias. The live-metrics adverse-selection quality
+            // loop is NOT used in the Python production path, so neutral 1.0 / 0.0 is correct parity.
+            lv = apply_quality_spread_multiplier(&lv, mid, 1.0, tick);
+            lv = apply_inventory_exit_bias(
+                &lv, mid, position, max_pos_usd, 0.0, self.adverse_threshold_bps, &self.inv_bias, tick,
+            );
+            lv
+        };
+
+        let ops = self.om.collect_order_operations(&levels, order_size, position, threshold_bps, now_ns);
+
+        // KEYSTONE: occupy slots the instant ops are emitted (before signing/sending) so the
+        // next quote cycle's collect can never duplicate an in-flight order. On send failure
+        // the sender enqueues ClearLive to reset the slot; reconcile clears any that never go live.
+        for op in &ops {
+            self.om.mark_pending(op);
+        }
+        // Publish tracked client-ids for the reconcile poller's orphan check.
+        self.tracked_ids.store(Arc::new(self.om.tracked_client_ids()));
 
         match self.mode {
             Mode::Shadow => {
-                if let (Some((b, _)), Some((_, a))) = (levels.first().copied(), levels.first().copied()) {
+                if let Some((b, a)) = levels.first().copied() {
                     tracing::info!(
                         "SHADOW vol={:.6} alpha={:.4} mid={:.4} L0_bid={:?} L0_ask={:?} ops={}",
-                        self.calc.volatility(), self.calc.alpha(), mid, b, a, ops.len()
+                        self.calc.volatility(),
+                        self.calc.alpha(),
+                        mid,
+                        b,
+                        a,
+                        ops.len()
                     );
-                }
-                // Shadow never sends; but exercise optimistic binding so collect dedupes.
-                for op in &ops {
-                    if matches!(op.action, crate::types::OrderAction::Create | crate::types::OrderAction::Modify) {
-                        self.om.apply_event(OrderEvent::BindLive {
-                            side: op.side, level: op.level, client_order_id: op.client_order_id,
-                            exchange_id: Some(op.client_order_id), price: op.price, size: op.size,
-                        });
-                    }
                 }
             }
             Mode::Live => {

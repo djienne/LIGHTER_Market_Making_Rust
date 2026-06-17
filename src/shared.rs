@@ -67,6 +67,16 @@ impl SharedAlpha {
         last == 0 || now_ms().saturating_sub(last) > threshold_ms
     }
 
+    /// Reset on a Binance feed reconnect / sequence-gap re-snapshot (Python `SharedAlpha.reset`):
+    /// zero the sample count + timestamp so `warmed_up`→false and `is_stale`→true, forcing the
+    /// hot path to drop the external-alpha override until the feed re-warms (no stale-alpha leak).
+    #[inline]
+    pub fn reset(&self) {
+        store_f64(&self.alpha_bits, 0.0, Ordering::Relaxed);
+        self.last_update_ms.store(0, Ordering::Relaxed);
+        self.sample_count.store(0, Ordering::Release);
+    }
+
     /// The value to inject as override, or None if not usable (stale or cold).
     #[inline]
     pub fn usable_alpha(&self, stale_ms: u64) -> Option<f64> {
@@ -133,6 +143,17 @@ impl SharedBbo {
         let last = self.last_update_ms.load(Ordering::Relaxed);
         last == 0 || now_ms().saturating_sub(last) > threshold_ms
     }
+    /// Reset on a Binance bookTicker reconnect (Python `SharedBBO.reset`): zero values + count
+    /// + timestamp so `warmed_up`/freshness gate downstream consumers until the feed re-warms.
+    #[inline]
+    pub fn reset(&self) {
+        store_f64(&self.best_bid, 0.0, Ordering::Relaxed);
+        store_f64(&self.best_ask, 0.0, Ordering::Relaxed);
+        store_f64(&self.bid_qty, 0.0, Ordering::Relaxed);
+        store_f64(&self.ask_qty, 0.0, Ordering::Relaxed);
+        self.last_update_ms.store(0, Ordering::Relaxed);
+        self.sample_count.store(0, Ordering::Release);
+    }
 }
 
 /// Position in base units (signed). Written by the account_all task, read in hot path.
@@ -182,6 +203,10 @@ pub struct Derived {
     max_pos_usd: AtomicU64,
     available_capital: AtomicU64,
     quota_remaining: AtomicU64, // i64 reinterpreted; u64::MAX == unknown
+    /// Wall-clock ms of the last market-data (order-book) update. The hot task stamps it on
+    /// every book message; the sender reads its age as a "market-data feed healthy" proxy
+    /// (Python `check_websocket_health`) when deciding whether to resume after a pause. 0 == none.
+    last_md_ms: AtomicU64,
 }
 
 impl Default for Derived {
@@ -197,6 +222,24 @@ impl Derived {
             max_pos_usd: AtomicU64::new(0),
             available_capital: AtomicU64::new(0),
             quota_remaining: AtomicU64::new(u64::MAX),
+            last_md_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Stamp the current time as the last market-data update (hot task, every book msg).
+    #[inline]
+    pub fn set_md_now(&self) {
+        self.last_md_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Age in ms since the last market-data update; `u64::MAX` if none yet (Python WS-health).
+    #[inline]
+    pub fn md_age_ms(&self) -> u64 {
+        let last = self.last_md_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            u64::MAX
+        } else {
+            now_ms().saturating_sub(last)
         }
     }
     pub fn set_base_amount(&self, v: f64) {
@@ -268,5 +311,13 @@ mod tests {
         assert_eq!(d.quota(), Some(42));
         d.set_base_amount(0.0002);
         assert!((d.base_amount() - 0.0002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn md_freshness() {
+        let d = Derived::new();
+        assert_eq!(d.md_age_ms(), u64::MAX); // none yet
+        d.set_md_now();
+        assert!(d.md_age_ms() < 1_000); // just stamped
     }
 }

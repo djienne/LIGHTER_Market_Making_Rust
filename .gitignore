@@ -12,6 +12,9 @@
 # Workflow scripts (session scratch)
 /.workflows
 
+# Codex review scratch traces
+.cxrev*.txt
+
 # Editor / OS
 *.swp
 .DS_Store

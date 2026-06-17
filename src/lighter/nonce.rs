@@ -40,6 +40,16 @@ impl NonceManager {
         self.nonce.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Roll back `n` reserved nonces in one shot (a whole batch that was signed but whose
+    /// frame was rejected/never-consumed). Mirrors the Python which calls
+    /// `acknowledge_failure` once per signed nonce. No-op for `n == 0`.
+    #[inline]
+    pub fn rollback(&self, n: usize) {
+        if n > 0 {
+            self.nonce.fetch_sub(n as i64, Ordering::SeqCst);
+        }
+    }
+
     /// Re-fetch from the API and reset to `N - 1` (after a nonce error / unknown outcome).
     pub async fn hard_refresh(&self, rest: &RestClient) -> Result<()> {
         let n = rest.next_nonce(self.account_index, self.api_key_index).await?;
@@ -68,5 +78,25 @@ mod tests {
         assert_eq!(nm.next(), 101);
         nm.acknowledge_failure(); // roll back the 101
         assert_eq!(nm.next(), 101);
+    }
+
+    #[test]
+    fn batch_rollback() {
+        let nm = NonceManager {
+            account_index: 1,
+            api_key_index: 0,
+            nonce: AtomicI64::new(199), // nextNonce 200 -> stored 199
+        };
+        // Reserve a batch of 4 (200..=203).
+        assert_eq!(nm.next(), 200);
+        assert_eq!(nm.next(), 201);
+        assert_eq!(nm.next(), 202);
+        assert_eq!(nm.next(), 203);
+        // Whole batch rejected without consuming nonces -> roll all 4 back.
+        nm.rollback(4);
+        assert_eq!(nm.next(), 200);
+        // rollback(0) is a no-op.
+        nm.rollback(0);
+        assert_eq!(nm.next(), 201);
     }
 }

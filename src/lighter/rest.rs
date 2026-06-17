@@ -142,6 +142,40 @@ impl RestClient {
         Self::parse_tx_response(resp).await
     }
 
+    /// Signed position (base units) for a market via REST — authoritative and independent of
+    /// the account WS (so position is never stale even if that WS dies).
+    pub async fn account_position(&self, account_index: i64, market_id: u32) -> Result<f64> {
+        let v: serde_json::Value = self
+            .http
+            .get(self.url("/api/v1/account"))
+            .query(&[("by", "index".to_string()), ("value", account_index.to_string())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("parse account")?;
+        let num = |x: Option<&serde_json::Value>| -> f64 {
+            match x {
+                Some(serde_json::Value::String(s)) => crate::lighter::messages::parse_f64(s),
+                Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+                _ => 0.0,
+            }
+        };
+        if let Some(acc) = v.get("accounts").and_then(|a| a.as_array()).and_then(|a| a.first()) {
+            if let Some(poss) = acc.get("positions").and_then(|p| p.as_array()) {
+                for p in poss {
+                    if p.get("market_id").and_then(|m| m.as_u64()) == Some(market_id as u64) {
+                        let mag = num(p.get("position")).abs();
+                        let sign = p.get("sign").and_then(|x| x.as_i64()).unwrap_or(1);
+                        return Ok(if sign < 0 { -mag } else { mag });
+                    }
+                }
+            }
+        }
+        Ok(0.0)
+    }
+
     /// GET /api/v1/getMakerOnlyApiKeys (maker-only restriction detection).
     pub async fn maker_only_api_keys(&self, account_index: i64) -> Result<serde_json::Value> {
         let v: serde_json::Value = self

@@ -69,6 +69,54 @@ pub fn is_quota_error(msg: &str) -> bool {
     (m.contains("not enough") && m.contains("quota")) || (m.contains("quota") && m.contains("exhausted"))
 }
 
+/// Quote-update threshold (bps) scaled by quota pressure — the standalone form of
+/// `_adaptive_threshold_bps`, callable from the hot path (which reads the live quota from the
+/// shared `Derived` atomic). Bands: `≥500 (or unknown) → base`, `≥50 → 2.0×`, `≥10 → 3.5×`,
+/// `<10 → 5.0×`. Used by both the hot task (requote decision) and [`RateLimiter`].
+pub fn quota_adaptive_threshold_bps(base: f64, quota: Option<i64>) -> f64 {
+    match quota {
+        None => base,
+        Some(q) if q >= RL_QUOTA_HIGH => base,
+        Some(q) if q >= RL_QUOTA_MEDIUM => base * 2.0,
+        Some(q) if q >= RL_QUOTA_LOW => base * 3.5,
+        Some(_) => base * 5.0,
+    }
+}
+
+/// Classification of a rejected-batch error message, mirroring the EXACT substring
+/// tests and ordering of the Python batch-reject handler (`sign_and_send_batch`,
+/// `market_maker_v2.py` ~L4340-4366). Each variant drives a distinct nonce-correction
+/// policy in the sender (see `paced_send::send_once`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectKind {
+    /// Volume-quota exhausted. Python: force quota=0, roll back reserved nonces, hard-refresh.
+    Quota,
+    /// 429 / too-many-requests. Python: global backoff, roll back reserved nonces (NO refresh —
+    /// don't hit REST while rate-limited; a 429 never consumed the nonce).
+    RateLimit,
+    /// Nonce desync. Python: authoritative hard-refresh (do NOT also roll back).
+    Nonce,
+    /// Any other business rejection (post-only cross, margin, ...). Python: roll back reserved
+    /// nonces AND hard-refresh (consumption is ambiguous; refresh is the source of truth).
+    Other,
+}
+
+/// Classify a reject message exactly as the Python does (quota → 429 → nonce → other).
+/// The quota test excludes the benign "quota remained"/"didn't use quota" informational
+/// strings, matching `"quota" in err and "remained" not in err and "didn't use" not in err`.
+pub fn classify_reject(msg: &str) -> RejectKind {
+    let m = msg.to_lowercase();
+    if m.contains("quota") && !m.contains("remained") && !m.contains("didn't use") {
+        RejectKind::Quota
+    } else if m.contains("429") || m.contains("too many") {
+        RejectKind::RateLimit
+    } else if m.contains("nonce") {
+        RejectKind::Nonce
+    } else {
+        RejectKind::Other
+    }
+}
+
 /// True for transient errors (429 / nonce / quota) that should trigger a
 /// backoff rather than the circuit breaker (`_is_transient_error`).
 pub fn is_transient_error(msg: &str) -> bool {
@@ -264,14 +312,7 @@ impl RateLimiter {
     /// Quote-update threshold (bps) scaled by quota pressure
     /// (`_adaptive_threshold_bps`). Multipliers: base / 2.0 / 3.5 / 5.0.
     pub fn adaptive_threshold_bps(&self) -> f64 {
-        let base = self.default_quote_update_threshold_bps;
-        match self.quota {
-            None => base,
-            Some(q) if q >= RL_QUOTA_HIGH => base,
-            Some(q) if q >= RL_QUOTA_MEDIUM => base * 2.0,
-            Some(q) if q >= RL_QUOTA_LOW => base * 3.5,
-            Some(_) => base * 5.0,
-        }
+        quota_adaptive_threshold_bps(self.default_quote_update_threshold_bps, self.quota)
     }
 
     // -- Global 429 backoff --------------------------------------------------
@@ -434,6 +475,33 @@ mod tests {
         assert!(is_quota_error("QUOTA EXHAUSTED"));
         assert!(!is_quota_error("invalid nonce"));
         assert!(!is_quota_error("not enough margin"));
+    }
+
+    #[test]
+    fn reject_classification_matches_python() {
+        use RejectKind::*;
+        // Quota exhaustion: contains "quota", not "remained"/"didn't use".
+        assert_eq!(classify_reject("Not enough volume quota remaining"), Quota);
+        assert_eq!(classify_reject("volume quota exhausted"), Quota);
+        assert_eq!(classify_reject("not enough quota"), Quota);
+        // Benign quota info ("remained"/"didn't use") must NOT be treated as quota → falls to Other.
+        assert_eq!(classify_reject("quota remained: 5"), Other);
+        assert_eq!(classify_reject("you didn't use your quota"), Other);
+        // 429 / rate limit.
+        assert_eq!(classify_reject("HTTP 429 Too Many Requests"), RateLimit);
+        assert_eq!(classify_reject("too many requests"), RateLimit);
+        // Nonce desync (only if not quota/429 first).
+        assert_eq!(classify_reject("invalid nonce"), Nonce);
+        assert_eq!(classify_reject("nonce too low: expected 7"), Nonce);
+        // Generic business rejections.
+        assert_eq!(classify_reject("post only order would cross the book"), Other);
+        assert_eq!(classify_reject("insufficient margin"), Other);
+        // Empty message → caller substitutes "code=<n>" (Python `message or f"code={code}"`):
+        // a 429 with no message must still classify as RateLimit, not Other.
+        assert_eq!(classify_reject("code=429"), RateLimit);
+        // An empty-message nonce reject (code=21104) has no "nonce" substring → Other, which
+        // matches Python's generic branch (rollback+refresh) for that case.
+        assert_eq!(classify_reject("code=21104"), Other);
     }
 
     #[test]

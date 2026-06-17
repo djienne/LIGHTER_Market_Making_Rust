@@ -43,6 +43,8 @@ impl BinanceBookTickerClient {
                 Ok(()) => {}
                 Err(e) => tracing::warn!("binance bookTicker session ended: {e}"),
             }
+            // Drop the stale BBO on disconnect so consumers see it as cold/stale until re-warm.
+            self.shared.reset();
             sleep(Duration::from_secs_f64(backoff)).await;
             backoff = (backoff * 2.0).min(self.reconnect_max);
         }
