@@ -96,12 +96,17 @@ pub enum RejectKind {
     RateLimit,
     /// Nonce desync. Python: authoritative hard-refresh (do NOT also roll back).
     Nonce,
+    /// Maker-only key restriction. Treat as a business rejection, but label it distinctly so
+    /// post-mortems can separate exchange permission issues from margin/post-only crosses.
+    MakerOnly,
     /// Any other business rejection (post-only cross, margin, ...). Python: roll back reserved
     /// nonces AND hard-refresh (consumption is ambiguous; refresh is the source of truth).
     Other,
 }
 
-/// Classify a reject message exactly as the Python does (quota → 429 → nonce → other).
+/// Classify a reject message in the same order as the Python handler for nonce/quota handling
+/// (quota → 429 → nonce → business rejection), with maker-only split out from generic business
+/// rejections for clearer logs.
 /// The quota test excludes the benign "quota remained"/"didn't use quota" informational
 /// strings, matching `"quota" in err and "remained" not in err and "didn't use" not in err`.
 pub fn classify_reject(msg: &str) -> RejectKind {
@@ -112,6 +117,11 @@ pub fn classify_reject(msg: &str) -> RejectKind {
         RejectKind::RateLimit
     } else if m.contains("nonce") {
         RejectKind::Nonce
+    } else if m.contains("maker-only api key")
+        || m.contains("maker only api key")
+        || m.contains("0ms delay transactions")
+    {
+        RejectKind::MakerOnly
     } else {
         RejectKind::Other
     }
@@ -493,6 +503,12 @@ mod tests {
         // Nonce desync (only if not quota/429 first).
         assert_eq!(classify_reject("invalid nonce"), Nonce);
         assert_eq!(classify_reject("nonce too low: expected 7"), Nonce);
+        // Maker-only key restrictions are business rejections, but classified distinctly for logs.
+        assert_eq!(
+            classify_reject("maker-only api key can only send 0ms delay transactions"),
+            MakerOnly
+        );
+        assert_eq!(classify_reject("maker only api key"), MakerOnly);
         // Generic business rejections.
         assert_eq!(classify_reject("post only order would cross the book"), Other);
         assert_eq!(classify_reject("insufficient margin"), Other);

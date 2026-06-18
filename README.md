@@ -96,7 +96,8 @@ The native signer binaries live in `signers/` (copied from the Python SDK).
   plus unknown-after-write handling.
 - **Live safety**: startup/shutdown use cancel-all + REST verification; live mode has a per-account
   single-instance lock, a reconcile poller, orphan cancellation, max-live-order cap enforcement, and
-  minute-level health logs for feed ages, position, capital, quota, and max-position state.
+  minute-level health logs for feed ages, position, capital, quota, and max-position state. Rejected
+  order batches log the exchange code, reject class, and exact op summary for post-mortem review.
 
 ## Status / remaining
 

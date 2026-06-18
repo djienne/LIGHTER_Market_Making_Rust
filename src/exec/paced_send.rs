@@ -149,6 +149,18 @@ fn clear_failed_creates(ctx: &SenderCtx, ops: &[BatchOp]) {
     }
 }
 
+fn op_summary(ops: &[BatchOp]) -> String {
+    ops.iter()
+        .map(|o| {
+            format!(
+                "{:?}/{}@{:.1}x{:.8} cid={} eid={:?} ro={}",
+                o.action, o.side, o.price, o.size, o.client_order_id, o.exchange_id, o.reduce_only
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn send_once(
     ctx: &SenderCtx,
     rate: &mut RateLimiter,
@@ -251,12 +263,7 @@ async fn send_once(
                 "SENT {} ops (quota={:?}): {}",
                 op_count,
                 result.quota_remaining,
-                signed
-                    .ops
-                    .iter()
-                    .map(|o| format!("{:?}/{}@{:.1}", o.action, o.side, o.price))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                op_summary(&signed.ops)
             );
             // Optimistic state updates: bind creates/modifies live, clear cancels.
             for op in &signed.ops {
@@ -289,13 +296,22 @@ async fn send_once(
             } else {
                 result.message.clone()
             };
-            ctx.risk.lock().record_rejection(&err_msg);
-            tracing::warn!("order rejected: code={} msg={}", result.code, err_msg);
+            let reject_kind = classify_reject(&err_msg);
+            ctx.risk
+                .lock()
+                .record_rejection(&format!("{reject_kind:?}:{err_msg}"));
+            tracing::warn!(
+                "order rejected: code={} kind={:?} msg={} ops=[{}]",
+                result.code,
+                reject_kind,
+                err_msg,
+                op_summary(&signed.ops)
+            );
             // Correct the nonce per the reject class, mirroring the Python batch-reject handler
             // (`sign_and_send_batch`, quota → 429 → nonce → other) EXACTLY. Where a refresh is
             // mandatory, a persistent refresh failure PAUSES trading rather than continuing with a
             // known-bad counter (resync_nonce_or_pause) — silently ignoring it restarts the cascade.
-            match classify_reject(&err_msg) {
+            match reject_kind {
                 RejectKind::Quota => {
                     // Quota exhausted at the gateway: nonces not consumed. Roll back + resync.
                     ctx.derived.set_quota(Some(0));
@@ -313,6 +329,12 @@ async fn send_once(
                     // Already desynced: re-sync from the API (authoritative). MUST succeed or we
                     // pause — there is no rollback here, so a failed refresh leaves a bad counter.
                     resync_nonce_or_pause(ctx, "reject_nonce").await;
+                }
+                RejectKind::MakerOnly => {
+                    // Permission/business rejection. Roll back + hard-refresh like Other, but keep
+                    // the kind distinct in logs so we can tell it apart from post-only/margin rejects.
+                    ctx.nonce.rollback(reserved);
+                    resync_nonce_or_pause(ctx, "reject_maker_only").await;
                 }
                 RejectKind::Other => {
                     // Business rejection (post-only cross, margin, ...): consumption is ambiguous,
