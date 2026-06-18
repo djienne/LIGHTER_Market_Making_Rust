@@ -68,6 +68,7 @@ struct LiveDeps {
     signer: Arc<Signer>,
     nonce: Arc<NonceManager>,
     sdk_lock: Arc<tokio::sync::Mutex<()>>,
+    reconcile_notify: Arc<Notify>,
     sender: tokio::task::JoinHandle<()>,
     /// Held (not used) for the process lifetime; releasing it frees the per-account flock.
     _instance_lock: InstanceLock,
@@ -218,6 +219,7 @@ impl App {
             evt_rx,
             reconcile_swap,
             tracked_ids,
+            live_deps.as_ref().map(|d| d.reconcile_notify.clone()),
             mode,
         );
         let mut md_handle = tokio::spawn(hot.run(self.config.clone(), self.market.clone()));
@@ -572,9 +574,106 @@ impl App {
             signer,
             nonce,
             sdk_lock,
+            reconcile_notify,
             sender,
             _instance_lock: instance_lock,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_market() -> MarketConfig {
+        MarketConfig {
+            market_id: 1,
+            symbol: "BTC".to_string(),
+            price_tick: 0.1,
+            amount_tick: 0.00001,
+            min_base_amount: 0.0002,
+            min_quote_amount: 10.0,
+            price_decimals: 1,
+            size_decimals: 5,
+        }
+    }
+
+    fn test_config() -> Config {
+        let mut cfg = Config {
+            trading: crate::config::Trading::default(),
+            performance: crate::config::Performance::default(),
+            websocket: crate::config::WebsocketCfg::default(),
+            safety: crate::config::Safety::default(),
+        };
+        cfg.trading.leverage = 2;
+        cfg.trading.levels_per_side = 2;
+        cfg.trading.base_amount = 0.0002;
+        cfg.trading.capital_usage_percent = 0.15;
+        cfg.trading.default_quote_update_threshold_bps = 8.0;
+        cfg.trading.spread_factor_level1 = 1.0;
+        cfg.trading.min_order_value_usd = 14.5;
+        cfg.trading.position_value_threshold_usd = 1.0;
+        cfg.performance.min_loop_interval = 0.0;
+        cfg.safety.stale_order_poller_interval_sec = 3.0;
+        cfg
+    }
+
+    fn test_hot_task(mode: Mode, reconcile_notify: Option<Arc<Notify>>) -> HotTask {
+        let cfg = test_config();
+        let (ops_tx, _ops_rx) = watch::channel(Vec::<BatchOp>::new());
+        let (_evt_tx, evt_rx) = mpsc::unbounded_channel();
+        HotTask::new(
+            test_market(),
+            &cfg,
+            cfg.trading.base_amount,
+            Arc::new(SharedAlpha::new(1)),
+            Arc::new(SharedPosition::new()),
+            Arc::new(Derived::new()),
+            ops_tx,
+            evt_rx,
+            Arc::new(ArcSwapOption::empty()),
+            Arc::new(ArcSwap::from_pointee(Vec::new())),
+            reconcile_notify,
+            mode,
+        )
+    }
+
+    #[tokio::test]
+    async fn live_position_change_holds_quotes_and_notifies_reconcile() {
+        let notify = Arc::new(Notify::new());
+        let mut hot = test_hot_task(Mode::Live, Some(notify.clone()));
+        let now = Instant::now();
+
+        assert!(!hot.hold_quotes_for_position_reconcile(0.0, now));
+
+        let changed_at = now + Duration::from_millis(1);
+        assert!(hot.hold_quotes_for_position_reconcile(0.00046, changed_at));
+        tokio::time::timeout(Duration::from_millis(10), notify.notified())
+            .await
+            .expect("position change notifies reconcile poller");
+
+        assert!(hot.hold_quotes_for_position_reconcile(
+            0.00046,
+            changed_at + Duration::from_secs(1)
+        ));
+        assert!(!hot.hold_quotes_for_position_reconcile(
+            0.00046,
+            changed_at + hot.position_hold + Duration::from_millis(1)
+        ));
+        assert!(hot.position_hold_until.is_none());
+    }
+
+    #[test]
+    fn shadow_position_change_does_not_hold_quotes() {
+        let mut hot = test_hot_task(Mode::Shadow, None);
+        let now = Instant::now();
+
+        assert!(!hot.hold_quotes_for_position_reconcile(0.0, now));
+        assert!(!hot.hold_quotes_for_position_reconcile(
+            0.00046,
+            now + Duration::from_millis(1)
+        ));
+        assert!(hot.position_hold_until.is_none());
     }
 }
 
@@ -762,9 +861,13 @@ struct HotTask {
     evt_rx: mpsc::UnboundedReceiver<OrderEvent>,
     reconcile_swap: ReconcileSwap,
     tracked_ids: TrackedIds,
+    reconcile_notify: Option<Arc<Notify>>,
     leverage: i32,
     mode: Mode,
     last_quote: Option<Instant>,
+    last_seen_position: Option<f64>,
+    position_hold_until: Option<Instant>,
+    position_hold: Duration,
     mid: f64,
 }
 
@@ -781,6 +884,7 @@ impl HotTask {
         evt_rx: mpsc::UnboundedReceiver<OrderEvent>,
         reconcile_swap: ReconcileSwap,
         tracked_ids: TrackedIds,
+        reconcile_notify: Option<Arc<Notify>>,
         mode: Mode,
     ) -> Self {
         let t = &config.trading;
@@ -824,11 +928,46 @@ impl HotTask {
             evt_rx,
             reconcile_swap,
             tracked_ids,
+            reconcile_notify,
             leverage: t.leverage,
             mode,
             last_quote: None,
+            last_seen_position: None,
+            position_hold_until: None,
+            position_hold: Duration::from_secs_f64(
+                config.safety.stale_order_poller_interval_sec.max(1.0) + 0.5,
+            ),
             mid: 0.0,
         }
+    }
+
+    fn hold_quotes_for_position_reconcile(&mut self, position: f64, now: Instant) -> bool {
+        if self.mode != Mode::Live {
+            return false;
+        }
+        if let Some(prev) = self.last_seen_position {
+            if (position - prev).abs() >= crate::strategy::quotes::EPSILON {
+                let until = now + self.position_hold;
+                self.position_hold_until = Some(until);
+                if let Some(notify) = &self.reconcile_notify {
+                    notify.notify_one();
+                }
+                tracing::warn!(
+                    "position changed {:.8} -> {:.8}; holding quote updates for {:.2}s pending reconcile",
+                    prev,
+                    position,
+                    self.position_hold.as_secs_f64()
+                );
+            }
+        }
+        self.last_seen_position = Some(position);
+        if let Some(until) = self.position_hold_until {
+            if now < until {
+                return true;
+            }
+            self.position_hold_until = None;
+        }
+        false
     }
 
     async fn run(mut self, config: Config, market: MarketConfig) {
@@ -957,6 +1096,10 @@ impl HotTask {
         let position = self.shared_pos.get();
         let capital = self.derived.capital();
         let tick = self.market.price_tick;
+        if self.hold_quotes_for_position_reconcile(position, now) {
+            let _ = self.ops_tx.send(Vec::new());
+            return;
+        }
 
         // Capital-derived dynamic order size (Python `calculate_dynamic_base_amount`): a fixed
         // fraction of capital * leverage / mid, normalized to exchange minimums. Falls back to the
