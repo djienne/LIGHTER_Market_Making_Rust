@@ -19,6 +19,8 @@ pub struct Config {
     pub websocket: WebsocketCfg,
     #[serde(default)]
     pub safety: Safety,
+    #[serde(default)]
+    pub pnl: PnlCfg,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -220,6 +222,26 @@ impl Default for Safety {
             max_live_orders_per_market: 4,
             panic_close_on_startup: false,
             panic_close_on_shutdown: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PnlCfg {
+    pub enabled: bool,
+    pub snapshot_interval_seconds: f64,
+    pub persist_dir: String,
+    pub include_unattributed_account_fills: bool,
+}
+
+impl Default for PnlCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            snapshot_interval_seconds: 60.0,
+            persist_dir: "logs".to_string(),
+            include_unattributed_account_fills: false,
         }
     }
 }

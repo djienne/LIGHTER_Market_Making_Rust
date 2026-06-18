@@ -207,20 +207,94 @@ impl PositionPayload {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct TradePayload {
+    #[serde(rename = "type", default)]
+    pub trade_type: Option<String>,
     #[serde(default)]
     pub price: Option<String>,
     #[serde(default)]
     pub size: Option<String>,
     #[serde(default)]
+    pub usd_amount: Option<String>,
+    #[serde(default)]
     pub is_maker_ask: Option<bool>,
+    #[serde(default)]
+    pub ask_id: Option<i64>,
+    #[serde(default)]
+    pub bid_id: Option<i64>,
+    #[serde(default)]
+    pub ask_client_id: Option<i64>,
+    #[serde(default)]
+    pub bid_client_id: Option<i64>,
     #[serde(default)]
     pub ask_account_id: Option<i64>,
     #[serde(default)]
     pub bid_account_id: Option<i64>,
     #[serde(default)]
+    pub ask_account_pnl: Option<String>,
+    #[serde(default)]
+    pub bid_account_pnl: Option<String>,
+    #[serde(default)]
+    pub maker_fee: Option<serde_json::Value>,
+    #[serde(default)]
+    pub taker_fee: Option<serde_json::Value>,
+    #[serde(default)]
     pub timestamp: Option<i64>,
     #[serde(default)]
+    pub transaction_time: Option<i64>,
+    #[serde(default)]
     pub trade_id: Option<i64>,
+}
+
+impl TradePayload {
+    #[inline]
+    pub fn price_f64(&self) -> Option<f64> {
+        parse_opt_f64(&self.price)
+    }
+
+    #[inline]
+    pub fn size_f64(&self) -> Option<f64> {
+        parse_opt_f64(&self.size)
+    }
+
+    #[inline]
+    pub fn usd_amount_f64(&self) -> Option<f64> {
+        parse_opt_f64(&self.usd_amount)
+    }
+
+    #[inline]
+    pub fn ask_account_pnl_f64(&self) -> Option<f64> {
+        parse_opt_f64(&self.ask_account_pnl)
+    }
+
+    #[inline]
+    pub fn bid_account_pnl_f64(&self) -> Option<f64> {
+        parse_opt_f64(&self.bid_account_pnl)
+    }
+
+    #[inline]
+    pub fn event_time_ms(&self) -> Option<i64> {
+        self.transaction_time
+            .or(self.timestamp)
+            .map(normalize_timestamp_ms)
+    }
+}
+
+#[inline]
+fn parse_opt_f64(v: &Option<String>) -> Option<f64> {
+    v.as_deref().and_then(|s| fast_float::parse(s).ok())
+}
+
+fn normalize_timestamp_ms(ts: i64) -> i64 {
+    let abs = ts.abs();
+    if abs > 10_000_000_000_000_000 {
+        ts / 1_000_000
+    } else if abs > 10_000_000_000_000 {
+        ts / 1_000
+    } else if abs < 10_000_000_000 {
+        ts * 1_000
+    } else {
+        ts
+    }
 }
 
 /// `user_stats/{a}` — capital/portfolio.
@@ -292,5 +366,45 @@ mod tests {
             avg_entry_price: None,
         };
         assert!((p.signed() + 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn parse_account_all_trade_fields_for_pnl() {
+        let raw = r#"{
+            "type":"update/account_all",
+            "trades":{"1":[{
+                "type":"trade",
+                "trade_id":123,
+                "timestamp":1781764389313,
+                "transaction_time":1781764389314,
+                "price":"64152.1",
+                "size":"0.00043",
+                "usd_amount":"27.585403",
+                "ask_id":11,
+                "bid_id":22,
+                "ask_client_id":111,
+                "bid_client_id":222,
+                "ask_account_id":9,
+                "bid_account_id":7,
+                "ask_account_pnl":"-0.01",
+                "bid_account_pnl":"0.02",
+                "is_maker_ask":false,
+                "maker_fee":40
+            }]}
+        }"#;
+        let msg: AccountAllMsg = serde_json::from_str(raw).unwrap();
+        let t = &msg.trades["1"][0];
+        assert_eq!(t.trade_type.as_deref(), Some("trade"));
+        assert_eq!(t.trade_id, Some(123));
+        assert_eq!(t.ask_client_id, Some(111));
+        assert_eq!(t.bid_client_id, Some(222));
+        assert_eq!(t.ask_id, Some(11));
+        assert_eq!(t.bid_id, Some(22));
+        assert_eq!(t.event_time_ms(), Some(1_781_764_389_314));
+        assert!((t.price_f64().unwrap() - 64152.1).abs() < 1e-12);
+        assert!((t.size_f64().unwrap() - 0.00043).abs() < 1e-12);
+        assert!((t.usd_amount_f64().unwrap() - 27.585403).abs() < 1e-12);
+        assert!((t.ask_account_pnl_f64().unwrap() + 0.01).abs() < 1e-12);
+        assert!((t.bid_account_pnl_f64().unwrap() - 0.02).abs() < 1e-12);
     }
 }

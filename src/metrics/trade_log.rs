@@ -54,6 +54,8 @@ pub const HEADER: [&str; 21] = [
 /// (matching the Python `notional = price * size if notional_usd is None`).
 #[derive(Debug, Clone, Default)]
 pub struct TradeRow {
+    /// Optional fill timestamp. When absent, the logger stamps current UTC time.
+    pub timestamp: Option<String>,
     /// "buy" / "sell" (see [`crate::types::Side::as_str`]).
     pub side: String,
     pub price: f64,
@@ -172,7 +174,10 @@ impl TradeLogger {
     /// Format a [`TradeRow`] into the 21 string cells, matching the Python
     /// `f"{...}"` specifiers exactly.
     fn format_row(symbol: &str, row: &TradeRow) -> Vec<String> {
-        let ts = Self::timestamp_now();
+        let ts = row
+            .timestamp
+            .clone()
+            .unwrap_or_else(Self::timestamp_now);
         // notional = price * size if notional_usd is None else notional_usd
         let notional = row.notional_usd.unwrap_or(row.price * row.size);
         vec![
@@ -408,6 +413,7 @@ mod tests {
         let logger = TradeLogger::new(&dir, "ETH").unwrap();
 
         logger.log_fill(TradeRow {
+            timestamp: None,
             side: "buy".to_string(),
             price: 100.25,
             size: 0.5,

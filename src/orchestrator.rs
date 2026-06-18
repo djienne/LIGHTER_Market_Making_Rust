@@ -7,6 +7,7 @@
 //! position, capital-derived params) via lock-free atomics, and emits order ops to the
 //! freshest-wins `watch` mailbox. COLD PATH: everything async/IO behind that boundary.
 
+use crate::account::pnl_actor::{PnlActor, PnlEvent, PositionSnapshot};
 use crate::book::local_book::LocalBook;
 use crate::config::{Config, Credentials};
 use crate::exec::instance_lock::InstanceLock;
@@ -75,6 +76,8 @@ struct LiveDeps {
     sdk_lock: Arc<tokio::sync::Mutex<()>>,
     reconcile_notify: Arc<Notify>,
     sender: tokio::task::JoinHandle<()>,
+    pnl_tx: Option<mpsc::UnboundedSender<PnlEvent>>,
+    pnl: Option<tokio::task::JoinHandle<()>>,
     /// Held (not used) for the process lifetime; releasing it frees the per-account flock.
     _instance_lock: InstanceLock,
 }
@@ -196,6 +199,7 @@ impl App {
                     reconcile_swap.clone(),
                     tracked_ids.clone(),
                     halt.clone(),
+                    shared_bbo.clone(),
                 )
                 .await?,
             )
@@ -266,6 +270,12 @@ impl App {
                 self.market.market_id,
             )
             .await;
+            if let Some(pnl_tx) = deps.pnl_tx {
+                let _ = pnl_tx.send(PnlEvent::Shutdown);
+            }
+            if let Some(pnl) = deps.pnl {
+                let _ = tokio::time::timeout(Duration::from_secs(5), pnl).await;
+            }
         }
         Ok(())
     }
@@ -281,6 +291,7 @@ impl App {
         reconcile_swap: ReconcileSwap,
         tracked_ids: TrackedIds,
         halt: Halt,
+        shared_bbo: Arc<SharedBbo>,
     ) -> Result<LiveDeps> {
         let aki = self.creds.api_key_index;
         let acct = self.creds.account_index;
@@ -332,6 +343,21 @@ impl App {
         // refuses new orders and the reconcile poller re-syncs the nonce + clears it (codex).
         let nonce_ok = Arc::new(AtomicBool::new(true));
         let recv_to = self.config.websocket.account_recv_timeout;
+        let (pnl_tx, pnl) = if self.config.pnl.enabled {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let actor = PnlActor::new(
+                self.config.pnl.clone(),
+                self.market.symbol.clone(),
+                self.market.market_id,
+                acct,
+                self.config.trading.maker_fee_rate,
+                shared_bbo.clone(),
+            )
+            .context("starting live PnL actor")?;
+            (Some(tx), Some(tokio::spawn(actor.run(rx))))
+        } else {
+            (None, None)
+        };
 
         // Paced sender (mailbox -> rate gate -> sign -> send). Handle is watched by `run()` so a
         // sender death triggers a clean cancel-all shutdown.
@@ -350,6 +376,7 @@ impl App {
                 events: evt_tx.clone(),
                 halt: halt.clone(),
                 nonce_ok: nonce_ok.clone(),
+                pnl: pnl_tx.clone(),
             },
             rate,
             ops_rx,
@@ -369,14 +396,28 @@ impl App {
             let mkt_str = mkt_id.to_string();
             let mut opts = SubscribeOptions::new("account_all", vec![ch]);
             opts.recv_timeout = recv_to;
+            let pnl = pnl_tx.clone();
             tokio::spawn(async move {
                 subscribe_loop_authed(
                     opts,
                     move || auth_map(&sgn, aki, &ch_auth),
                     move |data| {
                         if let Ok(msg) = serde_json::from_value::<AccountAllMsg>(data.clone()) {
-                            if let Some(p) = msg.positions.get(&mkt_str) {
-                                sp.set(p.signed());
+                            let position = msg.positions.get(&mkt_str).map(|p| PositionSnapshot {
+                                signed_position: p.signed(),
+                                entry_vwap: p
+                                    .avg_entry_price
+                                    .as_deref()
+                                    .and_then(|s| fast_float::parse(s).ok()),
+                            });
+                            if let Some(p) = position {
+                                sp.set(p.signed_position);
+                            }
+                            if let Some(pnl) = &pnl {
+                                let trades = msg.trades.get(&mkt_str).cloned().unwrap_or_default();
+                                if position.is_some() || !trades.is_empty() {
+                                    let _ = pnl.send(PnlEvent::AccountAll { position, trades });
+                                }
                             }
                         }
                     },
@@ -393,14 +434,25 @@ impl App {
             let ch_auth = ch.clone();
             let mut opts = SubscribeOptions::new("user_stats", vec![ch]);
             opts.recv_timeout = recv_to;
+            let pnl = pnl_tx.clone();
             tokio::spawn(async move {
                 subscribe_loop_authed(
                     opts,
                     move || auth_map(&sgn, aki, &ch_auth),
                     move |data| {
                         if let Ok(msg) = serde_json::from_value::<UserStatsMsg>(data.clone()) {
-                            if let Some(c) = msg.stats.available_capital() {
+                            let available_capital = msg.stats.available_capital();
+                            let portfolio_value = msg.stats.portfolio_value();
+                            if let Some(c) = available_capital {
                                 der.set_capital(c);
+                            }
+                            if let Some(pnl) = &pnl {
+                                if available_capital.is_some() || portfolio_value.is_some() {
+                                    let _ = pnl.send(PnlEvent::Capital {
+                                        available_capital,
+                                        portfolio_value,
+                                    });
+                                }
                             }
                         }
                     },
@@ -581,6 +633,8 @@ impl App {
             sdk_lock,
             reconcile_notify,
             sender,
+            pnl_tx,
+            pnl,
             _instance_lock: instance_lock,
         })
     }
@@ -609,6 +663,7 @@ mod tests {
             performance: crate::config::Performance::default(),
             websocket: crate::config::WebsocketCfg::default(),
             safety: crate::config::Safety::default(),
+            pnl: crate::config::PnlCfg::default(),
         };
         cfg.trading.leverage = 2;
         cfg.trading.levels_per_side = 2;
@@ -658,10 +713,9 @@ mod tests {
             .await
             .expect("position change notifies reconcile poller");
 
-        assert!(hot.hold_quotes_for_position_reconcile(
-            0.00046,
-            changed_at + Duration::from_secs(1)
-        ));
+        assert!(
+            hot.hold_quotes_for_position_reconcile(0.00046, changed_at + Duration::from_secs(1))
+        );
         assert!(!hot.hold_quotes_for_position_reconcile(
             0.00046,
             changed_at + hot.position_hold + Duration::from_millis(1)
@@ -675,10 +729,7 @@ mod tests {
         let now = Instant::now();
 
         assert!(!hot.hold_quotes_for_position_reconcile(0.0, now));
-        assert!(!hot.hold_quotes_for_position_reconcile(
-            0.00046,
-            now + Duration::from_millis(1)
-        ));
+        assert!(!hot.hold_quotes_for_position_reconcile(0.00046, now + Duration::from_millis(1)));
         assert!(hot.position_hold_until.is_none());
     }
 }

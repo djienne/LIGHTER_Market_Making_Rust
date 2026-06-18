@@ -88,5 +88,11 @@
         "max_live_orders_per_market": 4,
         "panic_close_on_startup": false,
         "panic_close_on_shutdown": false
+    },
+    "pnl": {
+        "enabled": true,
+        "snapshot_interval_seconds": 60.0,
+        "persist_dir": "logs",
+        "include_unattributed_account_fills": false
     }
 }

@@ -53,7 +53,7 @@ single-slot `watch` mailbox. All I/O (signing, sending, account, reconcile) is o
 | `binance/{obi,depth_client,book_ticker}.rs` | Binance OBI alpha + BBO feeds | ✅ |
 | `shared.rs` | lock-free `SharedAlpha`/`SharedBbo`/`SharedPosition`/`Derived` | ✅ |
 | `exec/{rate_limit,order_manager,collect,signing,paced_send}.rs` | rate limiter, order lifecycle, op collection, sign bridge, sender | ✅ |
-| `account/{fill_accounting,persistence}.rs` | VWAP/PnL, live-state JSON | ✅ |
+| `account/{fill_accounting,persistence,pnl_actor}.rs` | VWAP/PnL, live-state JSON, live session PnL actor | ✅ |
 | `metrics/{trade_log,live_metrics}.rs` | buffered CSV, markout quality adjustment | ✅ |
 | `risk.rs` | circuit breaker / pause | ✅ |
 | `orchestrator.rs` | bootstrap + hot task + feeds; shadow/live wiring, health logging | ✅ |
@@ -63,7 +63,7 @@ single-slot `watch` mailbox. All I/O (signing, sending, account, reconcile) is o
 
 ```bash
 cargo build --release            # optimized (LTO, panic=unwind for clean cancel-all on task panic)
-cargo test                       # 98 unit tests incl. parity and websocket/order-management tests
+cargo test                       # 103 unit tests incl. parity and websocket/order-management tests
 
 # Verify the native signer FFI matches the Python SDK (offline, no orders):
 cargo run --bin test_sign -- /home/ubuntu/lighter_MM/.env
@@ -82,6 +82,37 @@ RUST_LOG=info cargo run --release -- --symbol BTC --live
 (`API_KEY_PRIVATE_KEY`, `API_KEY_INDEX`, `ACCOUNT_INDEX`, `WALLET_ADDRESS`, `MARKET_SYMBOL`).
 The native signer binaries live in `signers/` (copied from the Python SDK).
 
+For manual live runs, run `lighter-mm` as the foreground process or as the direct service process
+and redirect logs to a file. Avoid wrapping the live process in `| tee` for production-style runs;
+stop the actual `lighter-mm` PID with SIGINT/SIGTERM and confirm the log contains
+`shutdown signal received`, `cancel-all OK`, `verified 0 active orders`, and `PNL_SUMMARY`.
+
+```bash
+mkdir -p logs
+set -a
+. /home/ubuntu/lighter_MM/.env
+set +a
+RUST_LOG=info ./target/release/lighter-mm --symbol BTC --live > "logs/live_$(date -u +%Y%m%d_%H%M%S).log" 2>&1
+```
+
+## Live PnL tracking
+
+Live mode starts a cold-path PnL actor when `pnl.enabled=true` in `config.json`. It does not run in
+shadow mode and does not add disk I/O, locks, or awaits to the quote loop. The actor consumes
+accepted bot client IDs from the paced sender and deduped `account_all` fills from the private
+websocket, then records only fills attributable to this bot process.
+
+Artifacts are written under `pnl.persist_dir` (default `logs/`):
+
+- `trades_{symbol}.csv`: one row per deduped strategy fill.
+- `pnl_session_{symbol}.json`: latest live session summary.
+- `pnl_snapshots_{symbol}.csv`: periodic session snapshots.
+
+The headline field is `strategy_realized_pnl_usdc`. `strategy_mtm_pnl_usdc` adds estimated
+unrealized PnL for any open inventory using the latest fresh Binance BBO mid. Account balance
+changes are not labeled strategy PnL because they can include inherited inventory, transfers, or
+manual account activity.
+
 ## What's verified
 
 - **Signer**: Rust FFI produces byte-identical `tx_info` to the Python SDK across all controllable
@@ -98,7 +129,8 @@ The native signer binaries live in `signers/` (copied from the Python SDK).
   single-instance lock, a reconcile poller, orphan cancellation, max-live-order cap enforcement, and
   minute-level health logs for feed ages, position, capital, quota, and max-position state. Rejected
   order batches log the exchange code, reject class, and exact op summary for post-mortem review;
-  business rejections force an immediate active-order reconcile before the next retry.
+  business rejections force an immediate active-order reconcile before the next retry. Live PnL logs
+  emit `PNL_FILL`, `PNL_HEALTH`, and `PNL_SUMMARY` lines for post-mortem review.
 
 ## Status / remaining
 
@@ -108,4 +140,3 @@ The native signer binaries live in `signers/` (copied from the Python SDK).
 - A fill-simulating dry-run engine (the Python `dry_run.py`) is not ported (use the Python one for
   backtests; the Rust bot targets live/shadow).
 - Docker packaging and a hot-path latency benchmark are pending.
-```

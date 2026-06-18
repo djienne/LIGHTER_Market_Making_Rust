@@ -6,6 +6,7 @@
 //! `OrderEvent`s. The `Unknown` outcome NEVER triggers a same-batch retry — it pauses
 //! trading, hard-refreshes the nonce, and requests reconciliation (codex invariant).
 
+use crate::account::pnl_actor::PnlEvent;
 use crate::exec::rate_limit::{classify_reject, RateLimiter, RejectKind};
 use crate::exec::signing::sign_batch;
 use crate::lighter::nonce::NonceManager;
@@ -40,6 +41,8 @@ pub struct SenderCtx {
     pub sdk_lock: Arc<tokio::sync::Mutex<()>>,
     /// Report order-state mutations back to the decision task (lossless).
     pub events: mpsc::UnboundedSender<OrderEvent>,
+    /// Optional live-only cold-path PnL actor. Never used by shadow mode.
+    pub pnl: Option<mpsc::UnboundedSender<PnlEvent>>,
 }
 
 /// Run the sender loop (OWNS the rate limiter — it is the only task that touches it, so no
@@ -151,9 +154,7 @@ fn clear_failed_creates(ctx: &SenderCtx, ops: &[BatchOp]) {
 }
 
 async fn force_reconcile_before_retry(ctx: &SenderCtx, reason: &str) {
-    tracing::warn!(
-        "business reject ({reason}); forcing active-order reconcile before next batch"
-    );
+    tracing::warn!("business reject ({reason}); forcing active-order reconcile before next batch");
     ctx.reconcile.notify_one();
     tokio::time::sleep(std::time::Duration::from_millis(
         BUSINESS_REJECT_RECONCILE_GRACE_MS,
@@ -277,6 +278,16 @@ async fn send_once(
                 result.quota_remaining,
                 op_summary(&signed.ops)
             );
+            if let Some(pnl) = &ctx.pnl {
+                let ids: Vec<i64> = signed
+                    .ops
+                    .iter()
+                    .filter_map(|op| (op.client_order_id > 0).then_some(op.client_order_id))
+                    .collect();
+                if !ids.is_empty() {
+                    let _ = pnl.send(PnlEvent::RegisterClientIds(ids));
+                }
+            }
             // Optimistic state updates: bind creates/modifies live, clear cancels.
             for op in &signed.ops {
                 match op.action {
