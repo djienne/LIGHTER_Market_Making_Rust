@@ -97,6 +97,7 @@ const MD_HEALTH_MS: u64 = 10_000;
 
 /// Attempts to re-sync the nonce from the API on a path where a correct nonce is MANDATORY.
 const NONCE_RESYNC_ATTEMPTS: usize = 3;
+const BUSINESS_REJECT_RECONCILE_GRACE_MS: u64 = 750;
 
 fn cancel_only(ops: &[BatchOp]) -> bool {
     ops.iter().all(|o| o.action == OrderAction::Cancel)
@@ -147,6 +148,17 @@ fn clear_failed_creates(ctx: &SenderCtx, ops: &[BatchOp]) {
             });
         }
     }
+}
+
+async fn force_reconcile_before_retry(ctx: &SenderCtx, reason: &str) {
+    tracing::warn!(
+        "business reject ({reason}); forcing active-order reconcile before next batch"
+    );
+    ctx.reconcile.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(
+        BUSINESS_REJECT_RECONCILE_GRACE_MS,
+    ))
+    .await;
 }
 
 fn op_summary(ops: &[BatchOp]) -> String {
@@ -332,15 +344,19 @@ async fn send_once(
                 }
                 RejectKind::MakerOnly => {
                     // Permission/business rejection. Roll back + hard-refresh like Other, but keep
-                    // the kind distinct in logs so we can tell it apart from post-only/margin rejects.
+                    // the kind distinct in logs so we can tell it apart from post-only/margin
+                    // rejects. These often happen immediately after a fill when a just-filled order
+                    // id is still in the hot task; force reconcile before another modify batch.
                     ctx.nonce.rollback(reserved);
                     resync_nonce_or_pause(ctx, "reject_maker_only").await;
+                    force_reconcile_before_retry(ctx, "maker_only").await;
                 }
                 RejectKind::Other => {
                     // Business rejection (post-only cross, margin, ...): consumption is ambiguous,
                     // so roll back the reservation AND resync from the API to be safe.
                     ctx.nonce.rollback(reserved);
                     resync_nonce_or_pause(ctx, "reject_other").await;
+                    force_reconcile_before_retry(ctx, "other").await;
                 }
             }
             // Reset slots for failed CREATEs so the hot task retries them (marked pending pre-send).
