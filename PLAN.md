@@ -7,6 +7,24 @@ atomics, ring buffers, single-writer hot path, zero-alloc steady state).
 Reference template: `standx/` (Rust MM for StandX — same OBI+vol strategy shape).
 Source of truth for behavior: `lighter_MM/` (Python, currently live).
 
+## Current status (2026-06-18)
+
+This file started as the detailed implementation plan. Keep `README.md` as the operator-facing
+runbook; keep `docs/CODEX_REVIEW_*.md` as historical review snapshots. Some older findings in those
+review files have since been fixed and should not be read as the current state.
+
+Current state:
+- Live and shadow modes are wired through the hot market-data task, paced sender, `account_all`,
+  `user_stats`, REST stale-order reconcile, risk pause/cancel-all handling, and live PnL tracking.
+- The release profile intentionally uses `panic = "unwind"` so supervised task panics can still
+  reach shutdown cancel-all.
+- Live-only PnL is on the cold path via `account::pnl_actor`; it writes `trades_{symbol}.csv`,
+  `pnl_session_{symbol}.json`, and `pnl_snapshots_{symbol}.csv`.
+- Latest local validation: `cargo test` passes 103 tests and `cargo build --release` passes.
+- Latest live BTC smoke: 20 minutes on 2026-06-18, max active orders observed 4, monitor violations
+  0, fills 0, strategy PnL 0.0 USDC. A direct-process shutdown test verified `cancel-all OK`,
+  `verified 0 active orders`, and `PNL_SUMMARY`.
+
 ---
 
 ## 0. Guiding principles
@@ -105,10 +123,10 @@ tx's own fields; both use the identical library).
    • sign batch via signer FFI (spawn_blocking)                                                │ │
    • send TxWebSocket (fallback REST) ; update quota atomic ; enqueue BIND_LIVE                │ │
                                                                                                │ │
- account_orders WS ─► order events → OrderManager (fills, cancels, reconcile snapshots)        │ │
- account_all WS    ─► positions+trades → SharedPosition (atomic) + fill accounting (PnL)        │ │
+ account_all WS    ─► positions+trades → SharedPosition + live PnL actor                        │ │
  user_stats WS     ─► capital/portfolio → derived params recompute (atomics)                    │ │
- reconciler / sanity / watchdog / telemetry / balance / quota-recovery background loops ────────┘ │
+ REST reconcile    ─► active-order snapshots → OrderManager + orphan/max-order safety           │ │
+ sanity / watchdog / telemetry / balance / quota-recovery background loops ─────────────────────┘ │
                                                                                                   │
  RiskController (circuit breaker / pause)  •  persistence (live_state json, trade csv)            │
                          └────────────────────────────────────────────────────────────────────────┘
@@ -134,7 +152,7 @@ mailbox (mirrors Python `_latest_ops`).
 | Signing | `spawn_blocking` (CPU-bound FFI) so it never stalls the runtime; batch multiple ops per signed tx. |
 | Hot path allocation | Pre-size all `Vec`s (`with_capacity(2*levels)`); reuse scratch buffers; `Arc<str>` symbols; no per-tick `String`. |
 | Numeric | `f64` everywhere on hot path (matches Python float). `rust_decimal` only if a cold-path accounting test demands it (default: f64 + explicit tick rounding `(_/tick).floor()*tick`). |
-| Build | `lto=true, codegen-units=1, opt-level=3, panic="abort"` (copy standx profile). |
+| Build | `lto=true, codegen-units=1, opt-level=3, panic="unwind"` so supervised task panics can still reach shutdown cancel-all. |
 
 ---
 
@@ -149,19 +167,13 @@ lighter_MM_RUST/
 ├── .env.example
 ├── signers/                    (copy of lighter-signer-*.so for all arches)
 ├── src/
-│   ├── main.rs                 # CLI args (--symbol, --live/--dry-run), signals, main()
+│   ├── main.rs                 # CLI args (--symbol, --shadow/--live), signals, main()
 │   ├── lib.rs
 │   ├── config.rs               # serde structs for config.json + env overrides + validate
 │   ├── types.rs                # Side, BatchOp, OrderAction, TxSendStatus/Result, ids
 │   ├── logging.rs              # tracing-subscriber (non-blocking file+console)
 │   │
-│   ├── shared/                 # lock-free cross-task primitives
-│   │   ├── mod.rs
-│   │   ├── atomic_f64.rs       # AlignedAtomicF64 helpers
-│   │   ├── shared_alpha.rs     # Binance OBI alpha+vol (from standx)
-│   │   ├── shared_bbo.rs       # Binance best bid/ask (from standx)
-│   │   ├── shared_position.rs  # position (atomic f64) (from standx)
-│   │   └── derived.rs          # base_amount, max_pos_usd, capital, mid, quota (atomics)
+│   ├── shared.rs               # lock-free SharedAlpha/Bbo/Position/Derived atomics
 │   │
 │   ├── book/
 │   │   ├── mod.rs
@@ -201,8 +213,8 @@ lighter_MM_RUST/
 │   ├── account/
 │   │   ├── mod.rs
 │   │   ├── fill_accounting.rs  # VWAP + realized PnL + fees (matches _apply_live_fill_accounting)
-│   │   ├── reconcile.rs        # local↔remote order diff, orphan cancel, stale poller
-│   │   └── persistence.rs      # live_state_{sym}.json atomic save/restore
+│   │   ├── persistence.rs      # live_state_{sym}.json atomic save/restore
+│   │   └── pnl_actor.rs        # live-only cold-path strategy PnL tracking
 │   │
 │   ├── metrics/
 │   │   ├── mod.rs
@@ -211,7 +223,6 @@ lighter_MM_RUST/
 │   │
 │   ├── risk.rs                 # RiskController (circuit breaker, pause/recover)
 │   ├── orchestrator.rs         # startup sequence, task supervision, warmup, shutdown
-│   └── dry_run.rs              # paper-trading fill simulator                [PHASE 1.5]
 └── tests/                      # parity tests vs Python golden vectors
 ```
 
@@ -284,22 +295,22 @@ Fee `=|price*size*maker_fee_rate|`. Flat→open; same-sign→VWAP add; opposite�
 `(exit-entry)*close_size` (signed by side), flip/flatten on cross. Persist after each.
 
 ### 5.9 `lighter::ws` + `auth` + reconcile (cold)
-Fast loop (`tokio::select!` recv/timeout/reconnect) for `order_book/ticker/trade`;
-std loop (long 1800s timeout) for `user_stats/account_all/account_orders`. Private
-channels need auth token (`CreateAuthToken`, refresh @9min). Orderbook snapshot vs delta
-by `type` (`subscribed/...`=snap, `update/...`=delta) + offset stale-guard. Reconcile:
-account_orders snapshot/delta drives BIND_LIVE/CLEAR_LIVE + orphan detection; REST stale
-poller every 3s (WS down) / 60s (WS up); orphan cancel via signed batch; pause after
-`debounce=2` mismatches.
+Fast loop (`tokio::select!` recv/timeout/reconnect) for `order_book/ticker`; long-timeout
+private loops for `account_all` and `user_stats`. Private channels use auth tokens generated by
+the native signer and refresh through reconnect/subscription handling. Orderbook snapshot vs delta
+is handled by `type` (`subscribed/...`=snap, `update/...`=delta) plus nonce/offset stale guards.
+The incremental `account_orders` stream is intentionally not used as an authoritative reconcile
+source because later messages are deltas, not full snapshots. Full active-order reconciliation uses
+REST `accountActiveOrders`, detects/cancels orphans, enforces `max_live_orders_per_market`, and arms
+risk pause/cancel-all after debounced mismatches.
 
 ### 5.10 `orchestrator` (cold)
-Startup: validate config → REST market details (ticks, mins) → build calculators →
-spawn Binance feeds (vol_obi engine) → signer create_client → cancel_all at startup →
-TxWebSocket connect → subscribe md/ticker → (live) subscribe account
-channels + init fill accounting from account snapshot → wait for first book/account →
-optional panic-close → spawn background tasks (balance, sanity, watchdog, telemetry,
-reconciler, order_state_reconcile, paced_send) → run hot md loop → graceful shutdown
-(bounded 15s task cancel, flush logs, cancel_all, optional panic-close, persist state).
+Startup: validate config → REST market details (ticks, mins) → spawn Binance OBI/BBO feeds →
+build shared atomics and hot task → in live mode acquire the single-instance lock, initialize nonce,
+connect TxWebSocket, run verified startup cancel-all, start paced sender, private account streams,
+REST stale-order reconcile, and optional live PnL actor → run the hot md loop. Shutdown sets the
+halt gate, waits for in-flight send serialization via `sdk_lock`, aborts the sender, runs verified
+cancel-all, and asks the PnL actor to flush `PNL_SUMMARY`.
 
 ---
 
@@ -307,51 +318,45 @@ reconciler, order_state_reconcile, paced_send) → run hot md loop → graceful 
 Same active keys/sections (`trading.{leverage,levels_per_side,base_amount,capital_usage_percent,
 default_quote_update_threshold_bps,spread_factor_level1,…,quote_engine,vol_obi{…},
 alpha{…},live_quality{…},inventory_exit_bias{…}},
-performance{…}, websocket{…}, safety{…}`). serde structs with `#[serde(default)]`;
+performance{…}, websocket{…}, safety{…}, pnl{…}`). serde structs with `#[serde(default)]`;
 env overrides (`MARKET_SYMBOL`, `API_KEY_*`, `ACCOUNT_INDEX`, `WALLET_ADDRESS`) via dotenvy.
 
 ---
 
-## 7. Phasing / milestones
+## 7. Milestone status
 
-- **P0 — Scaffold:** Cargo workspace, config, types, logging, signer FFI + a standalone
-  `bin/test_sign.rs` that loads the `.so`, creates client, signs a dummy order, prints
-  tx_info. **Gate: signing works & matches Python output for identical inputs.**
-- **P1 — Market data + signal:** local_book, rolling, vol_obi, binance feeds, shared
-  atomics. `bin/test_obi.rs` parity vs Python on a captured WS tape. **Gate: vol/alpha
-  match Python within 1e-9 on the same input stream.**
-- **P2 — Execution:** nonce, rest, tx_ws, rate_limit, order_manager, collect, paced_send.
-  Dry-run engine. **Gate: end-to-end dry-run quotes for 10 min, no panics, sane orders.**
-- **P3 — Account + safety:** account WS, fill_accounting, reconcile, risk, persistence,
-  metrics, orchestrator. **Gate: live-shadow (order.enabled=false) parity vs Python.**
-- **P5 — Hardening:** Docker, README, soak test, latency benchmark (p50/p99 hot path),
-  + final codex reviews (overall correctness + hot/cold/latency/lock-free).
+- **P0 — Scaffold/signer:** done; Rust FFI signs with the official `.so` and matches Python
+  controllable `tx_info` fields.
+- **P1 — Market data + signal:** done; local book, rolling stats, Vol/OBI, Binance OBI/BBO feeds,
+  and shared atomics are implemented with parity tests.
+- **P2 — Execution:** done for live/shadow; nonce, REST, TxWebSocket, rate limiter, order manager,
+  signing bridge, and paced sender are implemented.
+- **P3 — Account + safety:** done for live operation; `account_all`, `user_stats`, REST reconcile,
+  risk pause/cancel-all, persistence, metrics, and live PnL are wired.
+- **P5 — Hardening:** partially done; README/runbook, smoke tests, and review fixes are in place.
+  Docker packaging and a dedicated hot-path latency benchmark remain.
 
-Each gate: build (`cargo build --release`), `cargo clippy`, unit/parity tests, and a
-**GPT-5.5 (codex) review** of the diff before moving on.
+Routine gates: `cargo test`, `cargo build --release`, targeted smoke/live checks, and review of any
+changes touching live order management.
 
 ---
 
 ## 8. Testing & validation
-- **Golden vectors:** dump Python intermediate values (vol, alpha, quote prices, VWAP,
-  PnL, rate-limit decisions) to JSON; assert Rust matches within tolerance.
-- **WS tape replay:** capture a live Lighter+Binance WS session; replay into both Python
-  and Rust; diff orderbook state, mids, signals, and emitted ops.
-- **Signer parity:** same (market,price,amount,nonce,…) → identical tx_info/tx_hash from
-  Python `ctypes` path and Rust `libloading` path (both call the same `.so`).
-- **Dry-run soak:** 30+ min, assert no drift/deadlock; latency histogram of hot path.
-- **NEVER place live orders during dev.** Use dry-run / `order.enabled=false`. The VPS
-  already runs live bots — keep this crate fully isolated in `lighter_MM_RUST/`.
+- **Signer parity:** implemented via `test_sign`; both Rust and Python call the same `.so`.
+- **Vol/OBI parity:** implemented via `test_obi_parity`; deterministic parity is within floating
+  tolerance.
+- **Unit tests:** latest local suite passes 103 tests, including websocket response routing,
+  unknown-after-write handling, rate limiting, risk, order lifecycle, and live PnL attribution.
+- **Live smoke:** run only when explicitly intended, with a single instance per account/api key.
+  Prefer direct-process log redirection over `| tee` so SIGINT/SIGTERM hits the bot process and the
+  shutdown log contains verified cancel-all and `PNL_SUMMARY`.
 
-## 9. Risks & open items (verify during P0/P1)
-- **chain_id** value for `CreateClient` (likely from REST `/info` or a mainnet constant).
-- Exact **`.so` C-string ownership** (Python doesn't free → confirm no leak/UAF; copy then drop).
-- **TxWebSocket** exact init/handshake message & response schema (`code` 200→0 normalize).
-- **account_all / account_orders** field names (`sign`, `is_ask`, `status`, `client_order_index`,
-  `order_index`, fill `size/price/timestamp`) — lock down from live capture.
-- **order_expiry / GTT vs POST_ONLY** semantics (live uses POST_ONLY tif=2, expiry=-1=28d).
-- Multi-threaded vs current-thread tokio for the hot md task (pin md task; use a
-  dedicated runtime/thread if jitter observed).
+## 9. Remaining risks / open items
+- Docker packaging and a dedicated hot-path latency benchmark are still pending.
+- Long unattended live soaks should continue to monitor quota, active-order cap, reconcile
+  mismatches, private websocket freshness, and PnL attribution (`PNL_SKIP`/`PNL_LOCAL_MISMATCH`).
+- If quota consumption accelerates materially, increase the quote-replacement bps threshold or tune
+  the adaptive quota bands before continuing long live runs.
 
 ---
 
@@ -394,39 +399,19 @@ binding corrections are now part of the design (the most live-breaking first):
     maker-only-key detection, emergency close, leverage setup, unknown-outcome handling, and
     fill accounting are all implemented (Python live startup/shutdown `:5343,5543,5578,5707`).
 
-Blocking open items (codex): C-string free ✓, ABI asserts ✓, TxWebSocket unknown-outcome,
-account-stream field capture (live), raw-rounding parity, nonce-failure matrix, bounded-event
-overflow policy, maker-only handling. Non-blocking: tokio current- vs multi-thread (latency tuning).
+Current note: the blocking items from this review were addressed during later implementation and
+live-safety passes. The historical review text above is kept because it explains design decisions,
+but use the status sections in this file and `README.md` for the current runbook.
 
 ---
 
-## 11. Build status & second-round codex review (full reviews in `docs/`)
+## 11. Build status & review history
 
-**Built + verified:** signer FFI (byte-parity to Python), vol/OBI engine (1e-17 parity to the
-Cython engine), Binance alpha feeds, shared lock-free atomics, order manager + collect, rate
-limiter, signing bridge, tx WebSocket, paced sender, fill accounting, risk, persistence, metrics,
-REST/nonce/ws/auth, orchestrator with **shadow mode (verified live)** and **live mode fully wired**
-(paced_send + account_orders/account_all/user_stats WS with 9-min token refresh + REST reconcile
-poller). 89 unit tests pass.
+**Built + verified:** signer FFI, Vol/OBI parity, Binance alpha/BBO feeds, shared lock-free atomics,
+order manager + collect, rate limiter, signing bridge, TxWebSocket, paced sender, fill accounting,
+risk, persistence, metrics, REST/nonce/ws/auth, live/shadow orchestrator wiring, REST reconcile,
+and live PnL tracking. Latest local status: 103 unit tests pass and release build passes.
 
-**Two GPT-5.5 reviews run** (`docs/CODEX_REVIEW_correctness.md`, `docs/CODEX_REVIEW_hotpath_latency.md`).
-Fixes APPLIED from them:
-- Live wiring completed (was the #1 finding); `set_max_position_dollar` before `quote`.
-- `accountActiveOrders` rows with no `status` treated LIVE (prevents reconcile mass-clear → dup orders).
-- `ClearLive` only clears when the slot id matches (no clobbering a freshly-placed order).
-- Sign-batch abort rolls back ALL reserved nonces (no nonce gap); create price guarded to u32 range.
-- Order events + reconcile drained every tick before the quote throttle.
-- Rate limiter OWNED by paced_send (no mutex held across `write_slot` awaits).
-
-**Tracked follow-ups (not yet applied; see review docs):**
-- Sender: re-borrow freshest ops AFTER the rate wait; `NotSent` → REST `sendTxBatch` fallback;
-  free-slot path truncate multi-op → 1 reducing op via REST `sendTx`; count window ops on any
-  attempted frame (not only `Ok`); nonce hard-refresh on quota/reject classes.
-- Reconcile: detect + cancel orphan exchange orders and enforce `max_live_orders_per_market`.
-- Sizing: drive `base_amount` from capital+min-quote (currently fixed from config; max-pos IS dynamic).
-- Hot-path latency micro-opts: avoid `serde_json::Value` clone (borrow/simd-json), reuse level/ladder
-  scratch buffers (`SmallVec`/fixed arrays), publish adaptive threshold to an atomic the hot path reads.
-- Lock-free nuance: load the commit timestamp `Acquire` in `SharedAlpha`/`SharedBbo` (seqlock for `Derived`).
-- Pin the market-data/hot task to a dedicated current-thread runtime for p99 (after the above).
-- Docker image + hot-path latency benchmark.
-```
+The review files in `docs/` are retained as historical audit records. They are useful for root-cause
+context, but some findings have since been fixed; prefer this file plus `README.md` for current
+status.

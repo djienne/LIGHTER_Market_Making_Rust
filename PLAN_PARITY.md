@@ -9,6 +9,16 @@ Config values (config.json): capital_usage_percent=0.15, leverage=2, min_order_v
 vol_obi.warmup_seconds=600, vol_obi.min_half_spread_bps=4.0, safety.stale_order_debounce_count=2,
 rate_limit_send_interval=0.15. All already parsed in config.rs.
 
+## Current status (2026-06-18)
+
+This parity plan has mostly been executed:
+- Group A remains intentionally skipped because the adverse-selection quality loop is dead in the
+  Python production path.
+- Groups B, C, D, E, and F are implemented in the Rust live path.
+- Group G remains an intentional non-port.
+- Group H is closed by keeping Rust's explicit 0.15s configured/default send interval consistent
+  with `config.json`; it was not changed to 0.1.
+
 ---
 
 ## Group A — Live adverse-selection quality loop — **SKIPPED**
@@ -32,7 +42,7 @@ Rust does NOT widen spreads, shrink size, or boost inventory-exit (Python does a
 3. Apply `adj.spread_multiplier`→quality mult, `adj.adverse_bps`→inventory bias; `size_multiplier`→Group B.
 Shadow keeps neutral (no fill feed).
 
-## Group B — Capital-derived dynamic base_amount (HIGH) [audit #3]
+## Group B — Capital-derived dynamic base_amount — **DONE** [audit #3]
 **Gap:** order size is the static config `base_amount` (0.0002 BTC); Python sizes each order as
 `capital*capital_usage_percent*leverage/mid` (normalized), recomputed live. `capital_usage_percent`
 is dead config in Rust.
@@ -41,26 +51,26 @@ is dead config in Rust.
 max(min_quote,min_order_value_usd))`; pass to `collect_order_operations` (and keep
 `dynamic_max_position` coherent). Fall back to seed base when capital unknown (shadow).
 
-## Group C — Wall-clock warmup_seconds=600 gate (HIGH) [audit #6]
+## Group C — Wall-clock warmup_seconds=600 gate — **DONE** [audit #6]
 **Gap:** Rust quotes as soon as count warmup (min_warmup_samples=100) hits — seconds in, on a noisy
 vol estimate. Python suppresses ALL quoting for `warmup_seconds` (600s), bypassed only to quote a
 reduce-only exit if already holding inventory.
 **Fix:** record `loop_start: Instant` (first book tick); gate quoting on `elapsed>=warmup_seconds`
 **AND** `calc.warmed_up()`. Bypass: if `elapsed<warmup` but `|position|>=EPS`, allow fallback reduce-only.
 
-## Group D — calc.reset() only on first init, not every snapshot (MEDIUM) [audit #7]
+## Group D — calc.reset() only on first init, not every snapshot — **DONE** [audit #7]
 **Gap:** `on_orderbook` resets the vol/OBI calc on EVERY in-connection snapshot frame (wiping warmup);
 Python resets only on disconnect.
 **Fix:** `calc.reset()` only when `!book.initialized` (first snapshot); apply later in-connection
 snapshots to the book WITHOUT resetting calc. Reset calc in the WS `on_disconnect` callback instead.
 
-## Group E — Binance SharedAlpha/SharedBbo reset on reconnect (MEDIUM) [audit #8]
+## Group E — Binance SharedAlpha/SharedBbo reset on reconnect — **DONE** [audit #8]
 **Gap:** on Binance depth reconnect/re-snapshot the shared alpha is not reset → stale alpha leaks and
 post-resync warmup is bypassed. Python calls `SharedAlpha.reset()`.
 **Fix:** add `reset()` to SharedAlpha/SharedBbo (sample_count=0, last_update_ms=0, value=0); call from
 `BinanceObi::reset()` and the depth/book_ticker reconnect paths.
 
-## Group F — Reconcile circuit-breaker pauses (HIGH/MED) [audit #9, #10]
+## Group F — Reconcile circuit-breaker pauses — **DONE** [audit #9, #10]
 **Gap:** Rust only `mark_reconcile(false)` on mismatch/over-cap; Python ALSO arms a cooldown pause.
 **Fix:** in the poller — after a failed/mismatch poll, if `mismatch_streak>=max(1,stale_order_debounce_count)`
 → `trigger_pause`; in the over_cap branch, add `trigger_pause` alongside the cancel-all.
@@ -76,13 +86,15 @@ republish (Python never starves because it always sends the freshest). The stale
 send-interval on a continuously-requoting maker — negligible — vs. losing the dup guarantee.
 Documented in paced_send.rs::send_once.
 
-## Group H — rate_limit_send_interval default 0.1 + docs (LOW) [audit #11]
-**Fix:** align config.rs struct default 0.15→0.1 (Python fallback); fix stale "default 0.1" doc-comments.
-No live impact (config sets 0.15 explicitly).
+## Group H — rate_limit_send_interval default/doc decision — **CLOSED** [audit #11]
+**Decision:** keep Rust's default aligned with the live `config.json` value of 0.15s. No live impact
+from the earlier audit note because `config.json` explicitly sets 0.15s and the current default
+matches it.
 
 ---
 
-## Execution order
-H (trivial) → B (dyn base) → A (quality loop) → C (warmup) → D (calc reset) →
-E (binance reset) → F (pauses) → G (freshest-reborrow, careful). Build+test after each;
-re-smoke (verify ≤4 + stability) → 1-hour run.
+## Execution status
+
+Implemented/closed items were validated with the normal local checks and live smoke runs. Remaining
+follow-up outside this parity plan: longer unattended live soak plus Docker/latency benchmark work
+tracked in `PLAN.md`.
