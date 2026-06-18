@@ -45,6 +45,11 @@ type ReconcileSwap = Arc<ArcSwapOption<Vec<RemoteOrder>>>;
 type TrackedIds = Arc<ArcSwap<Vec<i64>>>;
 /// Set by shutdown to stop the sender placing new orders before cancel-all.
 type Halt = Arc<AtomicBool>;
+/// After a fill the account websocket can report the new position before active-order REST has
+/// stopped returning the filled order. Hold longer than one reconcile interval so the next quote
+/// cycle does not modify a just-filled exchange order id and trigger a maker-only batch reject.
+const POSITION_RECONCILE_SETTLE_BUFFER_SEC: f64 = 7.0;
+const POSITION_RECONCILE_MIN_HOLD_SEC: f64 = 10.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -644,6 +649,7 @@ mod tests {
         let mut hot = test_hot_task(Mode::Live, Some(notify.clone()));
         let now = Instant::now();
 
+        assert!((hot.position_hold.as_secs_f64() - 10.0).abs() < f64::EPSILON);
         assert!(!hot.hold_quotes_for_position_reconcile(0.0, now));
 
         let changed_at = now + Duration::from_millis(1);
@@ -935,7 +941,9 @@ impl HotTask {
             last_seen_position: None,
             position_hold_until: None,
             position_hold: Duration::from_secs_f64(
-                config.safety.stale_order_poller_interval_sec.max(1.0) + 0.5,
+                (config.safety.stale_order_poller_interval_sec.max(1.0)
+                    + POSITION_RECONCILE_SETTLE_BUFFER_SEC)
+                    .max(POSITION_RECONCILE_MIN_HOLD_SEC),
             ),
             mid: 0.0,
         }
