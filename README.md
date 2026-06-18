@@ -8,9 +8,9 @@ uses a clean **hot-path / cold-path** split and Rust-specific optimizations (loc
 atomics, Welford ring buffers, single-writer hot path, freshest-wins mailbox, FFI signing off the
 hot path).
 
-Observed resource use in a live BTC run on the current host: about **0.4% CPU** and **8 MB RSS**
-after warmup while maintaining four resting orders. Treat this as an environment-specific runtime
-observation, not a fixed guarantee.
+Observed resource use in live BTC runs on the current host: about **0.8% CPU** and **35 MB RSS**
+while managing live orders. Treat this as an environment-specific runtime observation, not a fixed
+guarantee.
 
 Strategy: **volatility + order-book-imbalance (OBI) alpha**, with an external Binance OBI feed —
 the same model as the live Python bot and the `standx` reference.
@@ -63,7 +63,7 @@ single-slot `watch` mailbox. All I/O (signing, sending, account, reconcile) is o
 
 ```bash
 cargo build --release            # optimized (LTO, panic=unwind for clean cancel-all on task panic)
-cargo test                       # 96 unit tests incl. parity and websocket-management tests
+cargo test                       # 98 unit tests incl. parity and websocket/order-management tests
 
 # Verify the native signer FFI matches the Python SDK (offline, no orders):
 cargo run --bin test_sign -- /home/ubuntu/lighter_MM/.env
