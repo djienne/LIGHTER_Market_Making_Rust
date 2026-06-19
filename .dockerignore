@@ -1,0 +1,12 @@
+.git
+.agents
+.codex
+.workflows
+target
+logs
+*.log
+.env
+*.pem
+.cxrev*.txt
+.DS_Store
+*.swp

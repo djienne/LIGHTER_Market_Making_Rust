@@ -4,5 +4,5 @@ The `CODEX_REVIEW_*.md` files in this directory are historical audit snapshots. 
 for understanding why live-safety changes were made, but they are not the current source of truth
 for project status.
 
-Use the root `README.md` for operator instructions and the root `PLAN.md` for the current
-implementation status and remaining work.
+Use the root `README.md` for operator instructions, `docs/DOCKER.md` for Docker run-mode details,
+and the root `PLAN.md` for the current implementation status and remaining work.

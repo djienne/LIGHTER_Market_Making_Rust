@@ -82,6 +82,32 @@ RUST_LOG=info cargo run --release -- --symbol BTC --live
 (`API_KEY_PRIVATE_KEY`, `API_KEY_INDEX`, `ACCOUNT_INDEX`, `WALLET_ADDRESS`, `MARKET_SYMBOL`).
 The native signer binaries live in `signers/` (copied from the Python SDK).
 
+### Docker
+
+The compose service defaults to a no-order warmup/validation run. It connects to live market data
+and computes quotes, but it does not place orders. The binary flag for this mode is currently
+`--shadow`, and logs show `mode=Shadow`.
+
+```bash
+mkdir -p logs
+docker compose build
+docker compose up
+```
+
+Live trading is explicit and uses real credentials. It starts live infrastructure immediately, runs
+startup cancel-all/flat-book verification, then keeps normal order placement gated by
+`trading.vol_obi.warmup_seconds` from `config.json` (`600` seconds in the checked-in config):
+
+```bash
+docker compose --env-file /path/to/.env run --rm --name lighter-mm-live lighter-mm \
+  --symbol BTC --config /app/config.json --live
+```
+
+Set `LIGHTER_UID` and `LIGHTER_GID` if the host `logs/` directory should be written by a user other
+than UID/GID `1000:1000`.
+
+See `docs/DOCKER.md` for the full Docker run-mode and shutdown notes.
+
 For manual live runs, run `lighter-mm` as the foreground process or as the direct service process
 and redirect logs to a file. Avoid wrapping the live process in `| tee` for production-style runs;
 stop the actual `lighter-mm` PID with SIGINT/SIGTERM and confirm the log contains
@@ -139,4 +165,4 @@ manual account activity.
   reconcile because it emits deltas rather than authoritative full active-order snapshots.
 - A fill-simulating dry-run engine (the Python `dry_run.py`) is not ported (use the Python one for
   backtests; the Rust bot targets live/shadow).
-- Docker packaging and a hot-path latency benchmark are pending.
+- A hot-path latency benchmark is pending.
