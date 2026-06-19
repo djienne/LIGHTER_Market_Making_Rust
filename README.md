@@ -99,7 +99,7 @@ startup cancel-all/flat-book verification, then keeps normal order placement gat
 `trading.vol_obi.warmup_seconds` from `config.json` (`600` seconds in the checked-in config):
 
 ```bash
-docker compose --env-file /path/to/.env run --rm --name lighter-mm-live lighter-mm \
+docker compose --env-file /path/to/.env run --name lighter-mm-live lighter-mm \
   --symbol BTC --config /app/config.json --live
 ```
 
@@ -157,6 +157,8 @@ manual account activity.
   order batches log the exchange code, reject class, and exact op summary for post-mortem review;
   business rejections force an immediate active-order reconcile before the next retry. Live PnL logs
   emit `PNL_FILL`, `PNL_HEALTH`, and `PNL_SUMMARY` lines for post-mortem review.
+- **Docker live run**: Docker live mode has been validated on BTC with the 600-second warmup gate,
+  live order placement, fills, PnL accounting, and clean SIGINT shutdown verification.
 
 ## Status / remaining
 

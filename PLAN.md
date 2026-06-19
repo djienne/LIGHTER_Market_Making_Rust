@@ -333,8 +333,8 @@ env overrides (`MARKET_SYMBOL`, `API_KEY_*`, `ACCOUNT_INDEX`, `WALLET_ADDRESS`) 
   signing bridge, and paced sender are implemented.
 - **P3 — Account + safety:** done for live operation; `account_all`, `user_stats`, REST reconcile,
   risk pause/cancel-all, persistence, metrics, and live PnL are wired.
-- **P5 — Hardening:** partially done; README/runbook, smoke tests, and review fixes are in place.
-  Docker packaging and a dedicated hot-path latency benchmark remain.
+- **P5 — Hardening:** partially done; README/runbook, Docker packaging, smoke/live checks, and
+  review fixes are in place. A dedicated hot-path latency benchmark remains.
 
 Routine gates: `cargo test`, `cargo build --release`, targeted smoke/live checks, and review of any
 changes touching live order management.
@@ -352,7 +352,10 @@ changes touching live order management.
   shutdown log contains verified cancel-all and `PNL_SUMMARY`.
 
 ## 9. Remaining risks / open items
-- Docker packaging and a dedicated hot-path latency benchmark are still pending.
+- A dedicated hot-path latency benchmark is still pending.
+- Docker live validation should continue periodically after material execution changes; the
+  2026-06-19 Docker BTC run covered the 600-second warmup gate, live order placement, fills, PnL
+  accounting, and clean shutdown verification.
 - Long unattended live soaks should continue to monitor quota, active-order cap, reconcile
   mismatches, private websocket freshness, and PnL attribution (`PNL_SKIP`/`PNL_LOCAL_MISMATCH`).
 - If quota consumption accelerates materially, increase the quote-replacement bps threshold or tune

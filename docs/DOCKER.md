@@ -24,8 +24,15 @@ Live trading is explicit. It uses real credentials and can place real orders aft
 warmup complete.
 
 ```bash
-docker compose --env-file /path/to/.env run --rm --name lighter-mm-live lighter-mm \
+docker compose --env-file /path/to/.env run --name lighter-mm-live lighter-mm \
   --symbol BTC --config /app/config.json --live
+```
+
+The live command intentionally does not use `--rm`, so `docker logs lighter-mm-live` remains
+available after shutdown. Remove the stopped container after reviewing logs:
+
+```bash
+docker rm lighter-mm-live
 ```
 
 Live startup behavior:
@@ -63,3 +70,9 @@ docker inspect -f 'status={{.State.Status}} restart={{.RestartCount}} oom={{.Sta
 docker stats --no-stream lighter-mm-live
 docker logs --since 5m lighter-mm-live
 ```
+
+## Latest Validation
+
+On 2026-06-19, a Docker BTC live run completed with the expected 600-second warmup followed by live
+order placement. The run sent orders after warmup, recorded fills, emitted PnL health/fill/summary
+events, and shut down cleanly with `cancel-all OK` plus `verified 0 active orders`.
