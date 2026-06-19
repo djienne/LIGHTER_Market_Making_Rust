@@ -84,23 +84,21 @@ The native signer binaries live in `signers/` (copied from the Python SDK).
 
 ### Docker
 
-The compose service defaults to a no-order warmup/validation run. It connects to live market data
-and computes quotes, but it does not place orders. The binary flag for this mode is currently
-`--shadow`, and logs show `mode=Shadow`.
+The compose service defaults to LIVE trading. It uses credentials from
+`/home/ubuntu/lighter_MM/.env` by default, starts live infrastructure immediately, runs startup
+cancel-all/flat-book verification, then keeps normal order placement gated by
+`trading.vol_obi.warmup_seconds` from `config.json` (`600` seconds in the checked-in config).
 
 ```bash
 mkdir -p logs
 docker compose build
-docker compose up
+docker compose up -d
 ```
 
-Live trading is explicit and uses real credentials. It starts live infrastructure immediately, runs
-startup cancel-all/flat-book verification, then keeps normal order placement gated by
-`trading.vol_obi.warmup_seconds` from `config.json` (`600` seconds in the checked-in config):
+To use a different credentials file, set `LIGHTER_ENV_FILE`:
 
 ```bash
-docker compose --env-file /path/to/.env run --name lighter-mm-live lighter-mm \
-  --symbol BTC --config /app/config.json --live
+LIGHTER_ENV_FILE=/path/to/.env docker compose up -d
 ```
 
 Set `LIGHTER_UID` and `LIGHTER_GID` if the host `logs/` directory should be written by a user other

@@ -10,14 +10,10 @@ services:
     stop_grace_period: 45s
     restart: "no"
     user: "${LIGHTER_UID:-1000}:${LIGHTER_GID:-1000}"
+    env_file:
+      - ${LIGHTER_ENV_FILE:-/home/ubuntu/lighter_MM/.env}
     environment:
       RUST_LOG: "${RUST_LOG:-info}"
-      MARKET_SYMBOL: "${MARKET_SYMBOL:-BTC}"
-      API_KEY_PRIVATE_KEY: "${API_KEY_PRIVATE_KEY:-}"
-      API_KEY_PUBLIC_KEY: "${API_KEY_PUBLIC_KEY:-}"
-      API_KEY_INDEX: "${API_KEY_INDEX:-0}"
-      ACCOUNT_INDEX: "${ACCOUNT_INDEX:-0}"
-      WALLET_ADDRESS: "${WALLET_ADDRESS:-}"
     volumes:
       - ./config.json:/app/config.json:ro
       - ./logs:/app/logs
@@ -26,4 +22,4 @@ services:
       - "${MARKET_SYMBOL:-BTC}"
       - --config
       - /app/config.json
-      - --shadow
+      - --live

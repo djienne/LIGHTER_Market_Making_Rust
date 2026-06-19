@@ -1,38 +1,24 @@
 # Docker Operations
 
-This project has two Docker run modes with different safety behavior.
+This project has two Docker run modes with different safety behavior. The default compose service is
+LIVE trading.
 
-## No-Order Warmup Run
+## Live Trading Run
 
-The default compose service is a no-order warmup and validation run. It connects to live market data
-and computes strategy quotes, but it never submits exchange orders. The current binary implements
-this with the `--shadow` flag and logs it as `mode=Shadow`; operator docs refer to it as the
-no-order warmup run.
+`docker compose up -d` starts real trading. It uses credentials from
+`/home/ubuntu/lighter_MM/.env` by default and can place real orders after startup checks and warmup
+complete.
 
 ```bash
 mkdir -p logs
 docker compose build
-docker compose up
+docker compose up -d
 ```
 
-Use this mode to validate Docker packaging, market-data connectivity, and quote calculation without
-placing orders.
-
-## Live Trading Run
-
-Live trading is explicit. It uses real credentials and can place real orders after startup checks and
-warmup complete.
+To use a different credentials file:
 
 ```bash
-docker compose --env-file /path/to/.env run --name lighter-mm-live lighter-mm \
-  --symbol BTC --config /app/config.json --live
-```
-
-The live command intentionally does not use `--rm`, so `docker logs lighter-mm-live` remains
-available after shutdown. Remove the stopped container after reviewing logs:
-
-```bash
-docker rm lighter-mm-live
+LIGHTER_ENV_FILE=/path/to/.env docker compose up -d
 ```
 
 Live startup behavior:
@@ -48,12 +34,21 @@ placed for roughly the first 10 minutes after the market loop starts. If the acc
 inventory, the bot may still emit passive reduce-only exit orders during warmup; when flat, it sends
 no normal quote orders until warmup completes.
 
-## Stop And Verify
+## No-Order Validation Run
 
-Stop the foreground live process with `Ctrl-C`, or stop a named container with:
+To validate market-data connectivity and quote calculation without submitting exchange orders, run
+the binary's `--shadow` mode explicitly. Logs show this as `mode=Shadow`.
 
 ```bash
-docker stop --signal SIGINT lighter-mm-live
+docker compose run --rm --no-deps lighter-mm --symbol BTC --config /app/config.json --shadow
+```
+
+## Stop And Verify
+
+Stop the compose-managed live container with:
+
+```bash
+docker compose stop lighter-mm
 ```
 
 For live runs, confirm the logs contain clean shutdown evidence:
@@ -66,9 +61,9 @@ For live runs, confirm the logs contain clean shutdown evidence:
 Useful checks while the container is running:
 
 ```bash
-docker inspect -f 'status={{.State.Status}} restart={{.RestartCount}} oom={{.State.OOMKilled}}' lighter-mm-live
-docker stats --no-stream lighter-mm-live
-docker logs --since 5m lighter-mm-live
+docker inspect -f 'status={{.State.Status}} restart={{.RestartCount}} oom={{.State.OOMKilled}}' lighter-mm
+docker stats --no-stream lighter-mm
+docker logs --since 5m lighter-mm
 ```
 
 ## Latest Validation
