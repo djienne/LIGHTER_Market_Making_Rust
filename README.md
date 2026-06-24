@@ -15,8 +15,6 @@ guarantee.
 Strategy: **volatility + order-book-imbalance (OBI) alpha**, with an external Binance OBI feed —
 the same model as the live Python bot and the `standx` reference.
 
-See `PLAN.md` for the full design, the GPT-5.5 plan review, and module specs.
-
 ## Architecture
 
 ```
