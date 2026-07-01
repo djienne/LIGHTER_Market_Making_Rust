@@ -56,9 +56,10 @@ pub struct LiveState {
     /// Lighter account index this state belongs to.
     #[serde(default)]
     pub account_index: i64,
-    /// Market id this state belongs to.
+    /// Market id this state belongs to (u32 to match `MarketConfig::market_id` — the old
+    /// `u8` silently truncated ids > 255).
     #[serde(default)]
-    pub market_id: u8,
+    pub market_id: u32,
     /// Local signed position-size estimate (`_live_fill_position_size`).
     #[serde(default)]
     pub position_size_est: f64,

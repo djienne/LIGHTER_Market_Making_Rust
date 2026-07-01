@@ -51,7 +51,10 @@ fn main() {
     for t in 0..N {
         let book = build_book(t);
         let mid = mid_at(t);
-        calc.on_book_update(mid, &book.bids, &book.asks);
+        // One full step per update: every update is sampled, matching the Python reference
+        // (which fed the Cython engine once per step). Parity is preserved because the
+        // cadence gate only DROPS sub-step updates; step-spaced inputs behave identically.
+        calc.on_book_update((t + 1) * 100_000_000, mid, &book.bids, &book.asks);
         last_mid = mid;
     }
 

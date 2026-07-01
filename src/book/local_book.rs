@@ -107,12 +107,18 @@ impl BookSide {
 
     /// Replace the whole side from a snapshot (already parsed levels).
     pub fn apply_snapshot(&mut self, mut levels: Vec<(f64, f64)>) {
+        self.apply_snapshot_scratch(&mut levels);
+    }
+
+    /// Snapshot from a caller-owned scratch buffer (sorted/filtered in place, then copied) —
+    /// the hot path reuses its scratch every message instead of allocating.
+    pub fn apply_snapshot_scratch(&mut self, levels: &mut Vec<(f64, f64)>) {
         self.clear();
         levels.retain(|&(_, s)| s != 0.0);
         levels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         self.prices.reserve(levels.len());
         self.sizes.reserve(levels.len());
-        for (p, s) in levels {
+        for &(p, s) in levels.iter() {
             self.prices.push(p);
             self.sizes.push(s);
         }
@@ -126,6 +132,9 @@ pub struct LocalBook {
     pub asks: BookSide,
     pub initialized: bool,
     pub last_offset: Option<u64>,
+    /// Matching-engine nonce of the last applied message. The next delta's `begin_nonce`
+    /// must equal this or updates were missed (Lighter's `offset` is NOT contiguous).
+    pub last_nonce: Option<i64>,
 }
 
 impl LocalBook {
@@ -135,6 +144,7 @@ impl LocalBook {
             asks: BookSide::new(),
             initialized: false,
             last_offset: None,
+            last_nonce: None,
         }
     }
 
@@ -143,6 +153,7 @@ impl LocalBook {
         self.asks.clear();
         self.initialized = false;
         self.last_offset = None;
+        self.last_nonce = None;
     }
 
     #[inline]
@@ -167,6 +178,13 @@ impl LocalBook {
     pub fn apply_snapshot(&mut self, bids: Vec<(f64, f64)>, asks: Vec<(f64, f64)>) {
         self.bids.apply_snapshot(bids);
         self.asks.apply_snapshot(asks);
+        self.initialized = true;
+    }
+
+    /// Snapshot from caller-owned scratch buffers (no per-message allocation on the hot path).
+    pub fn apply_snapshot_scratch(&mut self, bids: &mut Vec<(f64, f64)>, asks: &mut Vec<(f64, f64)>) {
+        self.bids.apply_snapshot_scratch(bids);
+        self.asks.apply_snapshot_scratch(asks);
         self.initialized = true;
     }
 

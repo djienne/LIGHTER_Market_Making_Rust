@@ -41,7 +41,7 @@ pub struct SenderCtx {
     pub sdk_lock: Arc<tokio::sync::Mutex<()>>,
     /// Report order-state mutations back to the decision task (lossless).
     pub events: mpsc::UnboundedSender<OrderEvent>,
-    /// Optional live-only cold-path PnL actor. Never used by shadow mode.
+    /// Optional live-only cold-path PnL actor. Never used by dry-run mode.
     pub pnl: Option<mpsc::UnboundedSender<PnlEvent>>,
 }
 
@@ -312,6 +312,9 @@ async fn send_once(
             }
         }
         TxSendStatus::Rejected => {
+            // The gateway SAW this batch even though it rejected it — count the ops against
+            // the sliding rate window so a reject storm cannot out-run the server-side limit.
+            rate.record_ops_sent(op_count);
             // Python classifies on `message or f"code={code}"` — an empty message with a
             // meaningful code (e.g. 429) must still be classified by the code (codex).
             let err_msg = if result.message.trim().is_empty() {

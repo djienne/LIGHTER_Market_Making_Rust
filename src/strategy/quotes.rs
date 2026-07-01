@@ -5,11 +5,15 @@
 //! Pure functions (no global state) so they are exhaustively testable.
 
 use crate::config::InventoryExitBias;
+use smallvec::{smallvec, SmallVec};
 
 pub const EPSILON: f64 = 1e-9;
 
 /// One quote level: (bid, ask), either side may be suppressed (None).
 pub type Level = (Option<f64>, Option<f64>);
+/// Quote ladder — stack-allocated up to 8 levels (levels_per_side is small), so the hot
+/// quote cycle builds/transforms the ladder without heap churn.
+pub type Levels = SmallVec<[Level; 8]>;
 
 /// Precompute spread factors `[spread_factor_level1^l for l in 0..num_levels]`.
 pub fn spread_factors(spread_factor_level1: f64, num_levels: usize) -> Vec<f64> {
@@ -45,8 +49,8 @@ pub fn build_quote_levels(
     num_levels: usize,
     factors: &[f64],
     fallback_bps: f64,
-) -> Vec<Level> {
-    let none_levels = vec![(None, None); num_levels];
+) -> Levels {
+    let none_levels = || -> Levels { smallvec![(None, None); num_levels] };
 
     let (mut buy_0, mut sell_0): (Option<f64>, Option<f64>) = match l0 {
         Some((b, a)) => (Some(b), Some(a)),
@@ -54,7 +58,7 @@ pub fn build_quote_levels(
             return if position.abs() >= EPSILON {
                 fallback_reduce_only(mid, position, tick, fallback_bps, num_levels)
             } else {
-                none_levels
+                none_levels()
             };
         }
     };
@@ -64,7 +68,7 @@ pub fn build_quote_levels(
         return if position.abs() >= EPSILON {
             fallback_reduce_only(mid, position, tick, fallback_bps, num_levels)
         } else {
-            none_levels
+            none_levels()
         };
     }
     let pos_value_usd = position.abs() * mid;
@@ -82,7 +86,7 @@ pub fn build_quote_levels(
     let bid_depth = buy_0.map(|b| mid - b);
     let ask_depth = sell_0.map(|a| a - mid);
 
-    let mut levels: Vec<Level> = Vec::with_capacity(num_levels);
+    let mut levels = Levels::new();
     levels.push((buy_0, sell_0));
     for lvl in 1..num_levels {
         let factor = factors.get(lvl).copied().unwrap_or(1.0);
@@ -93,31 +97,27 @@ pub fn build_quote_levels(
     levels
 }
 
-/// Widen each level's depth by `multiplier` (>1) — defensive on adverse markouts.
-pub fn apply_quality_spread_multiplier(levels: &[Level], mid: f64, multiplier: f64, tick: f64) -> Vec<Level> {
+/// Widen each level's depth by `multiplier` (>1), IN PLACE — defensive on adverse markouts.
+pub fn apply_quality_spread_multiplier(levels: &mut [Level], mid: f64, multiplier: f64, tick: f64) {
     if multiplier <= 1.0001 || mid <= 0.0 {
-        return levels.to_vec();
+        return;
     }
-    levels
-        .iter()
-        .map(|&(bid, ask)| {
-            let new_bid = bid.map(|b| {
-                let depth = (mid - b).max(0.0);
-                floor_tick(mid - depth * multiplier, tick)
-            });
-            let new_ask = ask.map(|a| {
-                let depth = (a - mid).max(0.0);
-                ceil_tick(mid + depth * multiplier, tick)
-            });
-            (new_bid, new_ask)
-        })
-        .collect()
+    for (bid, ask) in levels.iter_mut() {
+        if let Some(b) = *bid {
+            let depth = (mid - b).max(0.0);
+            *bid = Some(floor_tick(mid - depth * multiplier, tick));
+        }
+        if let Some(a) = *ask {
+            let depth = (a - mid).max(0.0);
+            *ask = Some(ceil_tick(mid + depth * multiplier, tick));
+        }
+    }
 }
 
-/// Bias quotes to flatten inventory: tighten the reducing side, widen the adding side.
+/// Bias quotes to flatten inventory, IN PLACE: tighten the reducing side, widen the adding side.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_inventory_exit_bias(
-    levels: &[Level],
+    levels: &mut [Level],
     mid: f64,
     position: f64,
     max_pos_usd: f64,
@@ -125,14 +125,14 @@ pub fn apply_inventory_exit_bias(
     adverse_threshold_bps: f64,
     cfg: &InventoryExitBias,
     tick: f64,
-) -> Vec<Level> {
+) {
     if !cfg.enabled || mid <= 0.0 || max_pos_usd <= 0.0 || position.abs() < EPSILON {
-        return levels.to_vec();
+        return;
     }
     let inventory_value = position.abs() * mid;
     let ratio = inventory_value / max_pos_usd;
     if ratio < cfg.min_ratio {
-        return levels.to_vec();
+        return;
     }
 
     let adverse_excess = (adverse_bps - adverse_threshold_bps).max(0.0);
@@ -140,42 +140,38 @@ pub fn apply_inventory_exit_bias(
     let exit_tighten = (cfg.exit_tighten_per_ratio.max(0.0) * ratio * boost).min(cfg.max_exit_tighten.max(0.0));
     let add_widen = (cfg.add_widen_per_ratio.max(0.0) * ratio * boost).min(cfg.max_add_widen.max(0.0));
     if exit_tighten <= 0.0 && add_widen <= 0.0 {
-        return levels.to_vec();
+        return;
     }
 
     let min_depth = if tick > 0.0 { tick } else { (mid * 1e-6).max(1e-9) };
-    levels
-        .iter()
-        .map(|&(bid, ask)| {
-            let new_bid = bid.map(|b| {
-                let mut depth = (mid - b).max(min_depth);
-                if position < 0.0 {
-                    depth *= (1.0 - exit_tighten).max(0.05); // short: bid reduces
-                } else {
-                    depth *= 1.0 + add_widen; // long: bid adds
-                }
-                let mut nb = floor_tick(mid - depth, tick);
-                if nb >= mid {
-                    nb = floor_tick(mid - min_depth, tick);
-                }
-                nb
-            });
-            let new_ask = ask.map(|a| {
-                let mut depth = (a - mid).max(min_depth);
-                if position > 0.0 {
-                    depth *= (1.0 - exit_tighten).max(0.05); // long: ask reduces
-                } else {
-                    depth *= 1.0 + add_widen; // short: ask adds
-                }
-                let mut na = ceil_tick(mid + depth, tick);
-                if na <= mid {
-                    na = ceil_tick(mid + min_depth, tick);
-                }
-                na
-            });
-            (new_bid, new_ask)
-        })
-        .collect()
+    for (bid, ask) in levels.iter_mut() {
+        if let Some(b) = *bid {
+            let mut depth = (mid - b).max(min_depth);
+            if position < 0.0 {
+                depth *= (1.0 - exit_tighten).max(0.05); // short: bid reduces
+            } else {
+                depth *= 1.0 + add_widen; // long: bid adds
+            }
+            let mut nb = floor_tick(mid - depth, tick);
+            if nb >= mid {
+                nb = floor_tick(mid - min_depth, tick);
+            }
+            *bid = Some(nb);
+        }
+        if let Some(a) = *ask {
+            let mut depth = (a - mid).max(min_depth);
+            if position > 0.0 {
+                depth *= (1.0 - exit_tighten).max(0.05); // long: ask reduces
+            } else {
+                depth *= 1.0 + add_widen; // short: ask adds
+            }
+            let mut na = ceil_tick(mid + depth, tick);
+            if na <= mid {
+                na = ceil_tick(mid + min_depth, tick);
+            }
+            *ask = Some(na);
+        }
+    }
 }
 
 /// A single passive reducing quote (level 0 only) when the engine withholds quotes.
@@ -185,8 +181,8 @@ pub fn fallback_reduce_only(
     tick: f64,
     fallback_bps: f64,
     num_levels: usize,
-) -> Vec<Level> {
-    let mut levels = vec![(None, None); num_levels];
+) -> Levels {
+    let mut levels: Levels = smallvec![(None, None); num_levels];
     if position.abs() < EPSILON || mid <= 0.0 {
         return levels;
     }
@@ -271,21 +267,21 @@ mod tests {
 
     #[test]
     fn quality_multiplier_widens() {
-        let levels = vec![(Some(99.0), Some(101.0))];
-        let out = apply_quality_spread_multiplier(&levels, 100.0, 1.5, 0.1);
+        let mut levels: Levels = smallvec![(Some(99.0), Some(101.0))];
+        apply_quality_spread_multiplier(&mut levels, 100.0, 1.5, 0.1);
         // depth 1 -> 1.5 ; bid 100-1.5=98.5, ask 100+1.5=101.5
-        assert!((out[0].0.unwrap() - 98.5).abs() < 1e-9);
-        assert!((out[0].1.unwrap() - 101.5).abs() < 1e-9);
+        assert!((levels[0].0.unwrap() - 98.5).abs() < 1e-9);
+        assert!((levels[0].1.unwrap() - 101.5).abs() < 1e-9);
     }
 
     #[test]
     fn inventory_bias_tightens_exit_long() {
         let cfg = InventoryExitBias::default();
-        let levels = vec![(Some(99.0), Some(101.0))];
+        let mut levels: Levels = smallvec![(Some(99.0), Some(101.0))];
         // long position near limit -> ask (exit) tightens toward mid, bid (add) widens
-        let out = apply_inventory_exit_bias(&levels, 100.0, 1.0, 100.0, 0.0, 2.0, &cfg, 0.1);
-        assert!(out[0].1.unwrap() < 101.0); // exit tighter
-        assert!(out[0].0.unwrap() < 99.0); // add wider
+        apply_inventory_exit_bias(&mut levels, 100.0, 1.0, 100.0, 0.0, 2.0, &cfg, 0.1);
+        assert!(levels[0].1.unwrap() < 101.0); // exit tighter
+        assert!(levels[0].0.unwrap() < 99.0); // add wider
     }
 
     #[test]

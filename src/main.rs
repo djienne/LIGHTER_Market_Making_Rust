@@ -1,11 +1,12 @@
 //! lighter-mm entry point.
 //!
 //! Usage:
-//!   lighter-mm [--symbol BTC] [--config config.json] [--shadow|--live]
+//!   lighter-mm [--symbol BTC] [--config config.json] [--dry-run|--live]
 //!
-//! `--shadow` (default) runs the full hot path against live market data WITHOUT sending
+//! `--dry-run` (default) runs the full hot path against live market data WITHOUT sending
 //! any orders — the safe way to verify the pipeline. `--live` enables real trading
-//! (requires credentials in .env and is intentionally gated).
+//! (requires credentials in .env and is intentionally gated). `--shadow` is a deprecated
+//! alias for `--dry-run`.
 
 use anyhow::Result;
 use lighter_mm::config::{Config, Credentials};
@@ -14,7 +15,8 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    lighter_mm::logging::init();
+    // Guard must live until exit: it owns the non-blocking log worker (flushes on drop).
+    let _log_guard = lighter_mm::logging::init();
     // Log panics through tracing (location + message) so a crash is visible in the bot log even
     // though we unwind (release `panic = "unwind"`) rather than abort. The unwinding then resolves
     // the panicking task's JoinHandle, letting `run()` perform the shutdown cancel-all.
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
 
     let mut symbol: Option<String> = None;
     let mut config_path = PathBuf::from("config.json");
-    let mut mode = Mode::Shadow;
+    let mut mode = Mode::DryRun;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -46,16 +48,35 @@ async fn main() -> Result<()> {
                     config_path = PathBuf::from(p);
                 }
             }
-            "--shadow" => mode = Mode::Shadow,
+            "--dry-run" => mode = Mode::DryRun,
+            "--shadow" => {
+                tracing::warn!("--shadow is deprecated; use --dry-run");
+                mode = Mode::DryRun;
+            }
             "--live" => mode = Mode::Live,
             other => tracing::warn!("ignoring unknown arg: {other}"),
         }
     }
 
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
-        tracing::warn!("config load failed ({e}); using defaults");
-        serde_json::from_str("{}").unwrap()
-    });
+    // A live bot must NEVER start on silent zero-defaults (leverage 0, sizes 0, spreads 0).
+    // Dry-run tolerates only a MISSING file; a malformed file aborts in both modes.
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            if mode == Mode::Live || config_path.exists() {
+                tracing::error!("config {} unusable: {e:#}", config_path.display());
+                return Err(e.context(format!("config {} unusable", config_path.display())));
+            }
+            tracing::warn!(
+                "config {} missing; dry-run continues on built-in defaults",
+                config_path.display()
+            );
+            serde_json::from_str("{}").unwrap()
+        }
+    };
+    if mode == Mode::Live {
+        config.validate_live()?;
+    }
 
     let mut creds = Credentials::from_env().unwrap_or_else(|_| Credentials {
         api_key_private_key: String::new(),

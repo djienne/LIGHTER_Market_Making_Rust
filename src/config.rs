@@ -23,7 +23,7 @@ pub struct Config {
     pub pnl: PnlCfg,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Trading {
     pub leverage: i32,
@@ -33,15 +33,44 @@ pub struct Trading {
     pub capital_usage_percent: f64,
     pub default_quote_update_threshold_bps: f64,
     pub spread_factor_level1: f64,
+    /// Unused (kept for config-schema compatibility with the Python bot).
     pub order_timeout_seconds: f64,
     pub position_value_threshold_usd: f64,
     pub min_order_value_usd: f64,
     pub maker_fee_rate: f64,
     pub quote_engine: String,
+    /// Send an update-leverage tx at LIVE startup so the venue's margin model matches the
+    /// config `leverage`/`margin_mode` used for sizing. Disable only if the account is
+    /// already configured and the tx is rejected (e.g. margin-mode change with open position).
+    pub set_leverage_on_startup: bool,
     pub live_quality: LiveQuality,
     pub inventory_exit_bias: InventoryExitBias,
     pub vol_obi: VolObiCfg,
     pub alpha: AlphaCfg,
+}
+
+impl Default for Trading {
+    fn default() -> Self {
+        Self {
+            leverage: 0,
+            margin_mode: String::new(),
+            levels_per_side: 0,
+            base_amount: 0.0,
+            capital_usage_percent: 0.0,
+            default_quote_update_threshold_bps: 0.0,
+            spread_factor_level1: 0.0,
+            order_timeout_seconds: 0.0,
+            position_value_threshold_usd: 0.0,
+            min_order_value_usd: 0.0,
+            maker_fee_rate: 0.0,
+            quote_engine: String::new(),
+            set_leverage_on_startup: true,
+            live_quality: LiveQuality::default(),
+            inventory_exit_bias: InventoryExitBias::default(),
+            vol_obi: VolObiCfg::default(),
+            alpha: AlphaCfg::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -165,6 +194,8 @@ impl Default for InventoryExitBias {
 pub struct Performance {
     pub min_loop_interval: f64,
     pub rate_limit_send_interval: f64,
+    /// Pin the hot market-data thread to this CPU core (best effort). `null` = unpinned.
+    pub pin_hot_core: Option<usize>,
 }
 
 impl Default for Performance {
@@ -172,6 +203,7 @@ impl Default for Performance {
         Self {
             min_loop_interval: 0.1,
             rate_limit_send_interval: 0.15,
+            pin_hot_core: None,
         }
     }
 }
@@ -209,6 +241,15 @@ pub struct Safety {
     pub max_live_orders_per_market: usize,
     pub panic_close_on_startup: bool,
     pub panic_close_on_shutdown: bool,
+    /// Dead-man switch: if no market-data update for this long (LIVE), park trading and
+    /// cancel-all once per pause. Protects against a stalled feed leaving stale quotes resting.
+    pub md_deadman_sec: f64,
+    /// Book sanity: if the local book mid diverges from the ticker mid by more than this many
+    /// bps for several consecutive ticks, force a reconnect for a fresh snapshot.
+    pub book_sanity_divergence_bps: f64,
+    /// How long Modify/Cancel ops are held after a position change while order ids settle
+    /// (fills resolve via the account WS + reconcile). Creates keep flowing during the hold.
+    pub position_change_hold_sec: f64,
 }
 
 impl Default for Safety {
@@ -222,6 +263,9 @@ impl Default for Safety {
             max_live_orders_per_market: 4,
             panic_close_on_startup: false,
             panic_close_on_shutdown: false,
+            md_deadman_sec: 10.0,
+            book_sanity_divergence_bps: 50.0,
+            position_change_hold_sec: 3.0,
         }
     }
 }
@@ -252,6 +296,34 @@ impl Config {
             .with_context(|| format!("reading config {}", path.display()))?;
         let cfg: Config = serde_json::from_str(&s).context("parsing config json")?;
         Ok(cfg)
+    }
+
+    /// Sanity-check values a LIVE run depends on. A live bot must never start on the silent
+    /// zero-defaults of a missing/typo'd config (leverage 0, sizes 0, spreads 0).
+    pub fn validate_live(&self) -> Result<()> {
+        let t = &self.trading;
+        if !t.quote_engine.eq_ignore_ascii_case("vol_obi") {
+            anyhow::bail!("config: quote_engine must be \"vol_obi\" (got {:?})", t.quote_engine);
+        }
+        if t.leverage < 1 {
+            anyhow::bail!("config: leverage must be >= 1 (got {})", t.leverage);
+        }
+        if t.levels_per_side < 1 {
+            anyhow::bail!("config: levels_per_side must be >= 1 (got {})", t.levels_per_side);
+        }
+        if t.capital_usage_percent <= 0.0 {
+            anyhow::bail!(
+                "config: capital_usage_percent must be > 0 (got {})",
+                t.capital_usage_percent
+            );
+        }
+        if t.spread_factor_level1 <= 0.0 {
+            anyhow::bail!(
+                "config: spread_factor_level1 must be > 0 (got {})",
+                t.spread_factor_level1
+            );
+        }
+        Ok(())
     }
 }
 

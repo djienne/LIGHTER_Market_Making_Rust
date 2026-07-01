@@ -1,8 +1,16 @@
-//! Vol + OBI quote engine — EXACT port of `_vol_obi_fast.pyx::VolObiCalculator`.
+//! Vol + OBI quote engine — port of `_vol_obi_fast.pyx::VolObiCalculator`.
 //!
-//! Hot path: `on_book_update(mid, bids, asks)` per orderbook tick updates rolling vol and
-//! OBI z-score (alpha). Trading loop: `quote(mid, position)` returns bid/ask in dollars.
+//! Hot path: `on_book_update(now_ns, mid, bids, asks)` per orderbook tick updates rolling vol
+//! and OBI z-score (alpha). Trading loop: `quote(mid, position)` returns bid/ask in dollars.
 //! Binance external alpha is injected via `set_alpha_override`.
+//!
+//! CADENCE (deliberate divergence from the raw pyx port): samples are pushed into the rolling
+//! windows on the `step_ns` clock, NOT on every raw book message. `vol_scale =
+//! sqrt(1e9/step_ns)` annualizes per-sample mid changes assuming step_ns spacing; Lighter
+//! publishes ~2x faster than the assumed 10/s, which silently underscaled volatility by
+//! ~sqrt(2) (spreads ~30% too tight) when every message was pushed. The z-score of the
+//! CURRENT imbalance is still refreshed every tick for alpha responsiveness — only the
+//! window contents are cadence-sampled.
 
 use crate::book::local_book::BookSide;
 use crate::strategy::rolling::RollingStats;
@@ -56,6 +64,9 @@ pub struct VolObiCalculator {
 
     // config / derived
     tick_size: f64,
+    step_ns: i64,
+    /// Timestamp (ns) of the last accepted sample; 0 = none yet.
+    last_sample_ns: i64,
     vol_scale: f64,
     vol_to_half_spread: f64,
     min_half_spread_bps: f64,
@@ -87,6 +98,8 @@ impl VolObiCalculator {
             warmed_up: false,
             total_samples: 0,
             tick_size,
+            step_ns: cfg.step_ns.max(1),
+            last_sample_ns: 0,
             vol_scale: (1_000_000_000.0 / cfg.step_ns as f64).sqrt(),
             vol_to_half_spread: cfg.vol_to_half_spread,
             min_half_spread_bps: cfg.min_half_spread_bps,
@@ -98,28 +111,44 @@ impl VolObiCalculator {
         }
     }
 
-    /// Hot path. Feed a new mid + book sides. Mirrors `on_book_update`.
+    /// Hot path. Feed a new mid + book sides with a monotonic-ish ns timestamp.
+    /// Window samples are accepted only every `step_ns` (see module docs); the alpha
+    /// z-score of the current imbalance refreshes every call.
     #[inline]
-    pub fn on_book_update(&mut self, mid_price: f64, bids: &BookSide, asks: &BookSide) {
-        // 1. mid-price change -> volatility input (dollars)
-        if self.has_prev_mid {
-            let change = mid_price - self.prev_mid;
-            self.mid_stats.push(change);
-            self.total_samples += 1;
-        }
-        self.prev_mid = mid_price;
-        self.has_prev_mid = true;
+    pub fn on_book_update(&mut self, now_ns: i64, mid_price: f64, bids: &BookSide, asks: &BookSide) {
+        let sample_due = self.last_sample_ns == 0 || now_ns - self.last_sample_ns >= self.step_ns;
 
-        // 2. OBI imbalance -> alpha input (quantity units)
+        // 1. mid-price change over one step -> volatility input (dollars). `prev_mid` is
+        // the mid at the PREVIOUS SAMPLE, so each pushed change spans ~step_ns regardless
+        // of the raw message rate.
+        if sample_due {
+            if self.has_prev_mid {
+                let change = mid_price - self.prev_mid;
+                self.mid_stats.push(change);
+                self.total_samples += 1;
+            }
+            self.prev_mid = mid_price;
+            self.has_prev_mid = true;
+            // Schedule the next sample step_ns from NOW (not last+step): after a quiet gap
+            // this avoids a burst of sub-step-spaced samples "catching up".
+            self.last_sample_ns = now_ns;
+        }
+
+        // 2. OBI imbalance -> alpha input (quantity units). Computed every tick (the
+        // z-score below keeps alpha responsive); pushed into the window on the step clock.
         let lower = mid_price * (1.0 - self.looking_depth);
         let upper = mid_price * (1.0 + self.looking_depth);
         let imbalance = bids.sum_sizes_from(lower) - asks.sum_sizes_to(upper);
-        self.imb_stats.push(imbalance);
+        if sample_due {
+            self.imb_stats.push(imbalance);
+        }
 
         // 3. update cached vol & alpha once warmed up
         if self.total_samples >= self.min_warmup_samples {
             self.warmed_up = true;
-            self.volatility = self.mid_stats.std() * self.vol_scale;
+            if sample_due {
+                self.volatility = self.mid_stats.std() * self.vol_scale;
+            }
             self.local_alpha = self.imb_stats.zscore(imbalance);
             self.alpha = if self.has_alpha_override {
                 self.alpha_override
@@ -216,6 +245,7 @@ impl VolObiCalculator {
         self.has_alpha_override = false;
         self.warmed_up = false;
         self.total_samples = 0;
+        self.last_sample_ns = 0;
     }
 
     #[inline]
@@ -268,10 +298,11 @@ mod tests {
             vec![(99.0, 1.0), (100.0, 1.0)],
             vec![(101.0, 1.0), (102.0, 1.0)],
         );
-        // feed > warmup samples with varying mids to create nonzero vol
+        // feed > warmup samples with varying mids to create nonzero vol; timestamps advance
+        // one full step per update so every update is sampled.
         for i in 0..10 {
             let mid = 100.5 + (i as f64) * 0.1;
-            c.on_book_update(mid, &book.bids, &book.asks);
+            c.on_book_update((i as i64 + 1) * 100_000_000, mid, &book.bids, &book.asks);
         }
         assert!(c.warmed_up());
         assert!(c.volatility() > 0.0);
@@ -279,6 +310,30 @@ mod tests {
         assert!(q.is_some());
         let (bid, ask) = q.unwrap();
         assert!(bid < ask);
+    }
+
+    #[test]
+    fn samples_on_step_clock_not_per_message() {
+        // Messages arriving at 2x the step rate (50ms vs step_ns=100ms) must be sampled
+        // every OTHER message — pushing every message underscaled volatility by ~sqrt(2).
+        let cfg = VolObiConfig {
+            min_warmup_samples: 1,
+            window_steps: 100,
+            ..Default::default()
+        };
+        let mut c = VolObiCalculator::new(&cfg, 0.1, 1000.0);
+        let mut book = LocalBook::new();
+        book.apply_snapshot(vec![(99.0, 1.0)], vec![(101.0, 1.0)]);
+        for i in 0..20i64 {
+            c.on_book_update(
+                (i + 1) * 50_000_000,
+                100.0 + i as f64 * 0.1,
+                &book.bids,
+                &book.asks,
+            );
+        }
+        // Accepted samples at i=0,2,4,...,18 (10 total); the first only seeds prev_mid.
+        assert_eq!(c.total_samples(), 9);
     }
 
     #[test]
@@ -291,8 +346,8 @@ mod tests {
         let mut c = VolObiCalculator::new(&cfg, 0.1, 1000.0);
         let mut book = LocalBook::new();
         book.apply_snapshot(vec![(99.0, 1.0)], vec![(101.0, 1.0)]);
-        for _ in 0..5 {
-            c.on_book_update(100.0, &book.bids, &book.asks);
+        for i in 0..5 {
+            c.on_book_update((i as i64 + 1) * 100_000_000, 100.0, &book.bids, &book.asks);
         }
         c.set_alpha_override(Some(2.5));
         assert!((c.alpha() - 2.5).abs() < 1e-12);

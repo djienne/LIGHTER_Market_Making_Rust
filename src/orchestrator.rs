@@ -15,7 +15,9 @@ use crate::exec::order_manager::OrderManager;
 use crate::exec::paced_send::{self, SenderCtx};
 use crate::exec::rate_limit::RateLimiter;
 use crate::lighter::auth::generate_ws_auth_token;
-use crate::lighter::messages::{AccountAllMsg, OrderBookMsg, RemoteOrder, TickerMsg, UserStatsMsg};
+use crate::lighter::messages::{
+    AccountAllMsg, AccountOrdersMsg, OrderBookMsg, RemoteOrder, TickerMsg, UserStatsMsg,
+};
 use crate::lighter::nonce::NonceManager;
 use crate::lighter::rest::{RestClient, BASE_URL};
 use crate::lighter::signer::Signer;
@@ -28,7 +30,7 @@ use crate::strategy::quotes::{
     fallback_reduce_only, normalize_live_order_size, spread_factors,
 };
 use crate::strategy::vol_obi::{VolObiCalculator, VolObiConfig};
-use crate::types::{BatchOp, MarketConfig, OrderEvent};
+use crate::types::{BatchOp, MarketConfig, OrderAction, OrderEvent};
 use crate::util::dynamic_max_position;
 use anyhow::{Context, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -46,16 +48,15 @@ type ReconcileSwap = Arc<ArcSwapOption<Vec<RemoteOrder>>>;
 type TrackedIds = Arc<ArcSwap<Vec<i64>>>;
 /// Set by shutdown to stop the sender placing new orders before cancel-all.
 type Halt = Arc<AtomicBool>;
-/// After a fill the account websocket can report the new position before active-order REST has
-/// stopped returning the filled order. Hold longer than one reconcile interval so the next quote
-/// cycle does not modify a just-filled exchange order id and trigger a maker-only batch reject.
-const POSITION_RECONCILE_SETTLE_BUFFER_SEC: f64 = 7.0;
-const POSITION_RECONCILE_MIN_HOLD_SEC: f64 = 10.0;
+/// Ticker BBO older than this is ignored by the book-sanity cross-check.
+const SANITY_TICKER_FRESH: Duration = Duration::from_secs(5);
+/// Consecutive diverged book ticks before the sanity check forces a fresh snapshot.
+const SANITY_STREAK_TRIP: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Full hot path against live data, but NO orders sent (safe verification).
-    Shadow,
+    DryRun,
     /// Live trading (sends real orders). Gated behind --live + order.enabled.
     Live,
 }
@@ -156,7 +157,7 @@ impl App {
         );
         derived.set_base_amount(base_amount);
         // Live: seed 0 so we NEVER quote before capital+position feeds arrive (codex #7).
-        // Shadow: effectively unlimited so the pipeline is exercised without account feeds.
+        // Dry-run: effectively unlimited so the pipeline is exercised without account feeds.
         derived.set_max_pos_usd(if mode == Mode::Live { 0.0 } else { 1.0e12 });
 
         // --- Binance alpha feeds (cold) ---
@@ -231,28 +232,52 @@ impl App {
             live_deps.as_ref().map(|d| d.reconcile_notify.clone()),
             mode,
         );
-        let mut md_handle = tokio::spawn(hot.run(self.config.clone(), self.market.clone()));
+        // The HOT task runs on its OWN OS thread with a current-thread runtime (optionally
+        // core-pinned): cold-path work (REST, PnL CSV/fsync, logging) can never add scheduler
+        // jitter to the market-data tick. All cross-task primitives in use (watch/mpsc/
+        // Notify/atomics/ArcSwap) are runtime-agnostic.
+        //
+        // Death detection: the oneshot resolves Ok on loop exit and Err when a panic unwinds
+        // the thread (sender dropped) — same semantics the JoinHandle gave, so a hot-path
+        // crash still reaches the cancel-all below and never leaves orders resting. On
+        // shutdown the thread is left running (nothing to abort); the sender halt + verified
+        // cancel-all are what matter, and process exit reaps it.
+        let (md_dead_tx, mut md_dead_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let cfg = self.config.clone();
+            let market = self.market.clone();
+            let pin_core = self.config.performance.pin_hot_core;
+            std::thread::Builder::new()
+                .name("hot-md".into())
+                .spawn(move || {
+                    if let Some(core) = pin_core {
+                        pin_current_thread(core);
+                    }
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("hot-md runtime");
+                    rt.block_on(hot.run(cfg, market));
+                    let _ = md_dead_tx.send(());
+                })
+                .context("spawning hot-md thread")?;
+        }
 
-        // Wait for a shutdown signal OR for a critical task to die unexpectedly. With
-        // `panic = "unwind"` (release profile) a panic in the hot task or sender unwinds that
-        // task and resolves its JoinHandle (Err on panic) instead of aborting the process — so
-        // we always reach the cancel-all path below and never leave orders resting on a crash.
         if let Some(deps) = live_deps.as_mut() {
             tokio::select! {
                 _ = wait_for_shutdown() => tracing::info!("shutdown signal received"),
-                r = &mut md_handle => tracing::error!("HOT (market-data) task exited unexpectedly ({r:?}); shutting down"),
+                r = &mut md_dead_rx => tracing::error!("HOT (market-data) thread exited unexpectedly ({r:?}); shutting down"),
                 r = &mut deps.sender => tracing::error!("paced sender task exited unexpectedly ({r:?}); shutting down"),
             }
         } else {
             tokio::select! {
                 _ = wait_for_shutdown() => tracing::info!("shutdown signal received"),
-                r = &mut md_handle => tracing::error!("HOT (market-data) task exited unexpectedly ({r:?}); shutting down"),
+                r = &mut md_dead_rx => tracing::error!("HOT (market-data) thread exited unexpectedly ({r:?}); shutting down"),
             }
         }
 
         // SAFETY shutdown: stop placing NEW orders, drain any in-flight send, then verify flat.
         halt.store(true, Ordering::SeqCst);
-        md_handle.abort();
         if let Some(deps) = live_deps {
             // Acquire sdk_lock BEFORE aborting the sender: this WAITS for any in-flight send_once
             // to finish its outcome handling and RELEASE the lock. Aborting it mid-send could let
@@ -322,7 +347,58 @@ impl App {
             acct,
         )?);
         let nonce = Arc::new(NonceManager::init(&self.rest, acct, aki).await?);
-        let tx_ws = Arc::new(TxWebSocket::new(WS_URL));
+
+        // Align the venue's margin model with the config used for sizing — leverage/margin_mode
+        // previously drove only the LOCAL max-position math and were never sent to the exchange,
+        // so an account configured differently would invalidate every sizing assumption.
+        // imf = 10000/leverage mirrors the Python SDK's update_leverage.
+        if self.config.trading.set_leverage_on_startup {
+            let margin_mode = if self.config.trading.margin_mode.eq_ignore_ascii_case("isolated") {
+                crate::lighter::signer::MARGIN_MODE_ISOLATED
+            } else {
+                crate::lighter::signer::MARGIN_MODE_CROSS
+            };
+            let leverage = self.config.trading.leverage.max(1);
+            let imf = 10_000 / leverage;
+            let n = nonce.next();
+            let tx = match signer.sign_update_leverage(mkt_id as i32, imf, margin_mode, n, aki) {
+                Ok(t) => t,
+                Err(e) => {
+                    nonce.acknowledge_failure();
+                    anyhow::bail!("startup update-leverage sign failed: {e}");
+                }
+            };
+            let resp = self.rest.send_tx(tx.tx_type, &tx.tx_info).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "startup update-leverage send failed: {e} \
+                     (align the account manually and set trading.set_leverage_on_startup=false to skip)"
+                )
+            })?;
+            if resp.code != 0 && resp.code != 200 {
+                anyhow::bail!(
+                    "startup update-leverage rejected: code={} msg={} — align the account \
+                     manually or set trading.set_leverage_on_startup=false",
+                    resp.code,
+                    resp.message
+                );
+            }
+            tracing::info!(
+                "update-leverage OK: {}x {} (imf={}) market_id={}",
+                leverage,
+                if margin_mode == crate::lighter::signer::MARGIN_MODE_ISOLATED {
+                    "isolated"
+                } else {
+                    "cross"
+                },
+                imf,
+                mkt_id
+            );
+        }
+
+        let tx_ws = Arc::new(TxWebSocket::with_ping_interval(
+            WS_URL,
+            Duration::from_secs_f64(self.config.websocket.ping_interval.max(1.0)),
+        ));
         let _ = tx_ws.connect().await;
 
         // SAFETY: clear any pre-existing orders AND verify a flat book before enabling sending.
@@ -343,6 +419,7 @@ impl App {
         // refuses new orders and the reconcile poller re-syncs the nonce + clears it (codex).
         let nonce_ok = Arc::new(AtomicBool::new(true));
         let recv_to = self.config.websocket.account_recv_timeout;
+        let ping_iv = self.config.websocket.ping_interval;
         let (pnl_tx, pnl) = if self.config.pnl.enabled {
             let (tx, rx) = mpsc::unbounded_channel();
             let actor = PnlActor::new(
@@ -352,6 +429,7 @@ impl App {
                 acct,
                 self.config.trading.maker_fee_rate,
                 shared_bbo.clone(),
+                derived.clone(),
             )
             .context("starting live PnL actor")?;
             (Some(tx), Some(tokio::spawn(actor.run(rx))))
@@ -385,24 +463,60 @@ impl App {
         // NOTE: order-state reconciliation is driven ONLY by the REST stale-poller below,
         // which returns FULL active-order snapshots (correct for process_reconcile). The
         // account_orders WS sends INCREMENTAL deltas that must NOT go through full reconcile
-        // (codex #1: would clear real resting orders and cause duplicates), so it is not wired.
+        // (codex #1: would clear real resting orders and cause duplicates) — it is wired
+        // below for client->exchange ID MAPPING ONLY (IdResolved events), which cuts the
+        // create->modifiable latency from the ~3s REST poll to ~100ms.
+        {
+            let sgn = signer.clone();
+            let evt = evt_tx.clone();
+            let ch = format!("account_orders/{}/{}", mkt_id, acct);
+            let ch_auth = ch.clone();
+            let mut opts = SubscribeOptions::new("account_orders", vec![ch]);
+            opts.recv_timeout = recv_to;
+            opts.ping_interval = ping_iv;
+            tokio::spawn(async move {
+                subscribe_loop_authed(
+                    opts,
+                    move || auth_map(&sgn, aki, &ch_auth),
+                    move |_mtype, raw| {
+                        if let Ok(msg) = serde_json::from_str::<AccountOrdersMsg>(raw) {
+                            for orders in msg.orders.values() {
+                                for o in orders {
+                                    if let (Some(c), Some(e)) = (o.client_order_index, o.order_index)
+                                    {
+                                        let _ = evt.send(OrderEvent::IdResolved {
+                                            client_order_id: c,
+                                            exchange_id: e,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+                .await;
+            });
+        }
 
-        // account_all -> position (atomic, lock-free read in hot path).
+        // account_all -> position (atomic, lock-free read in hot path) + own-fill events
+        // (hot task clears/shrinks the filled slot immediately -> instant re-quote).
         {
             let sp = shared_pos.clone();
             let sgn = signer.clone();
+            let evt = evt_tx.clone();
             let ch = format!("account_all/{}", acct);
             let ch_auth = ch.clone();
             let mkt_str = mkt_id.to_string();
             let mut opts = SubscribeOptions::new("account_all", vec![ch]);
             opts.recv_timeout = recv_to;
+            opts.ping_interval = ping_iv;
             let pnl = pnl_tx.clone();
             tokio::spawn(async move {
                 subscribe_loop_authed(
                     opts,
                     move || auth_map(&sgn, aki, &ch_auth),
-                    move |data| {
-                        if let Ok(msg) = serde_json::from_value::<AccountAllMsg>(data.clone()) {
+                    move |_mtype, raw| {
+                        if let Ok(msg) = serde_json::from_str::<AccountAllMsg>(raw) {
                             let position = msg.positions.get(&mkt_str).map(|p| PositionSnapshot {
                                 signed_position: p.signed(),
                                 entry_vwap: p
@@ -413,8 +527,32 @@ impl App {
                             if let Some(p) = position {
                                 sp.set(p.signed_position);
                             }
+                            let trades = msg.trades.get(&mkt_str).cloned().unwrap_or_default();
+                            // Own-fill events for the hot task (both sides can be ours only on
+                            // a self-cross, which post-only prevents; emit each match anyway).
+                            for t in &trades {
+                                let size = t.size_f64().unwrap_or(0.0);
+                                if size <= 0.0 {
+                                    continue;
+                                }
+                                if t.ask_account_id == Some(acct) {
+                                    if let Some(cid) = t.ask_client_id {
+                                        let _ = evt.send(OrderEvent::Fill {
+                                            client_order_id: cid,
+                                            filled_size: size,
+                                        });
+                                    }
+                                }
+                                if t.bid_account_id == Some(acct) {
+                                    if let Some(cid) = t.bid_client_id {
+                                        let _ = evt.send(OrderEvent::Fill {
+                                            client_order_id: cid,
+                                            filled_size: size,
+                                        });
+                                    }
+                                }
+                            }
                             if let Some(pnl) = &pnl {
-                                let trades = msg.trades.get(&mkt_str).cloned().unwrap_or_default();
                                 if position.is_some() || !trades.is_empty() {
                                     let _ = pnl.send(PnlEvent::AccountAll { position, trades });
                                 }
@@ -434,13 +572,14 @@ impl App {
             let ch_auth = ch.clone();
             let mut opts = SubscribeOptions::new("user_stats", vec![ch]);
             opts.recv_timeout = recv_to;
+            opts.ping_interval = ping_iv;
             let pnl = pnl_tx.clone();
             tokio::spawn(async move {
                 subscribe_loop_authed(
                     opts,
                     move || auth_map(&sgn, aki, &ch_auth),
-                    move |data| {
-                        if let Ok(msg) = serde_json::from_value::<UserStatsMsg>(data.clone()) {
+                    move |_mtype, raw| {
+                        if let Ok(msg) = serde_json::from_str::<UserStatsMsg>(raw) {
                             let available_capital = msg.stats.available_capital();
                             let portfolio_value = msg.stats.portfolio_value();
                             if let Some(c) = available_capital {
@@ -474,8 +613,13 @@ impl App {
             let sp = shared_pos.clone();
             let rsk = risk.clone();
             let nok = nonce_ok.clone();
+            let der = derived.clone();
             let interval = self.config.safety.stale_order_poller_interval_sec.max(1.0);
             let max_live = self.config.safety.max_live_orders_per_market.max(1);
+            // Dead-man threshold: market data older than this parks trading + pulls the book.
+            let deadman_ms = (self.config.safety.md_deadman_sec.max(1.0) * 1000.0) as u64;
+            // REST position is only a FALLBACK when the account WS has gone quiet this long.
+            let pos_fallback_ms = (2.0 * interval * 1000.0) as u64;
             // Consecutive reconcile-mismatch polls before the circuit breaker arms a cooldown pause
             // (Python `STALE_ORDER_DEBOUNCE_COUNT`, floored at 1).
             let debounce_min = self.config.safety.stale_order_debounce_count.max(1) as u32;
@@ -495,6 +639,35 @@ impl App {
                         _ = notify.notified() => {}
                         _ = tokio::time::sleep(std::time::Duration::from_secs_f64(interval)) => {}
                     }
+
+                    // DEAD-MAN SWITCH: a stalled market-data feed must never leave stale quotes
+                    // resting (the WS watchdog only reconnects; nothing else pulls orders). Park
+                    // trading and cancel-all ONCE per pause (pause_cancel_done re-arms on the
+                    // next pause / after recovery). Recovery is the normal path: cooldown +
+                    // fresh market data (ws_healthy) + a clean reconcile.
+                    let md_age = der.md_age_ms();
+                    if md_age != u64::MAX && md_age > deadman_ms {
+                        let need_cancel = {
+                            let mut r = rsk.lock();
+                            r.mark_reconcile(false, "md_stale");
+                            if !r.is_paused() {
+                                r.trigger_pause(&format!("market data stale {md_age}ms"));
+                            }
+                            let need = !r.pause_cancel_done();
+                            if need {
+                                r.set_pause_cancel_done(true);
+                            }
+                            need
+                        };
+                        if need_cancel {
+                            tracing::error!(
+                                "DEAD-MAN: market data stale {md_age}ms -> cancel-all + pause"
+                            );
+                            let _g = sdk.lock().await;
+                            let _ = cancel_all_and_verify(&sgn, &nm, &rest, aki, acct, mkt_id).await;
+                        }
+                    }
+
                     let tok = match generate_ws_auth_token(&sgn, aki) {
                         Ok(t) => t,
                         // A failed reconcile must BLOCK pause-recovery (Python mark_reconcile(ok=False))
@@ -546,9 +719,15 @@ impl App {
 
                     // Full snapshot -> hot task refreshes/clears tracked slots.
                     rsw.store(Some(Arc::new(orders.clone())));
-                    // Authoritative position via REST (never stale even if account WS dies).
-                    if let Ok(pos) = rest.account_position(acct, mkt_id).await {
-                        sp.set(pos);
+                    // REST position is a FALLBACK for a dead/quiet account WS only. Never
+                    // overwrite a fresh WS value: an in-flight REST read taken just before a
+                    // fill would clobber the newer WS position, flap it back, and re-arm the
+                    // position hold spuriously.
+                    let ws_pos_age = sp.age_ms();
+                    if ws_pos_age == u64::MAX || ws_pos_age > pos_fallback_ms {
+                        if let Ok(pos) = rest.account_position(acct, mkt_id).await {
+                            sp.set(pos);
+                        }
                     }
 
                     // SAFETY: too many live orders => something desynced; cancel-all + keep pause parked.
@@ -704,7 +883,8 @@ mod tests {
         let mut hot = test_hot_task(Mode::Live, Some(notify.clone()));
         let now = Instant::now();
 
-        assert!((hot.position_hold.as_secs_f64() - 10.0).abs() < f64::EPSILON);
+        // Hold duration comes from safety.position_change_hold_sec (default 3.0).
+        assert!((hot.position_hold.as_secs_f64() - 3.0).abs() < f64::EPSILON);
         assert!(!hot.hold_quotes_for_position_reconcile(0.0, now));
 
         let changed_at = now + Duration::from_millis(1);
@@ -724,8 +904,8 @@ mod tests {
     }
 
     #[test]
-    fn shadow_position_change_does_not_hold_quotes() {
-        let mut hot = test_hot_task(Mode::Shadow, None);
+    fn dry_run_position_change_does_not_hold_quotes() {
+        let mut hot = test_hot_task(Mode::DryRun, None);
         let now = Instant::now();
 
         assert!(!hot.hold_quotes_for_position_reconcile(0.0, now));
@@ -767,6 +947,18 @@ async fn cancel_all_orders(
     }
     tracing::info!("cancel-all OK (code={})", resp.code);
     Ok(())
+}
+
+/// Pin the calling thread to `core` (best effort; logs the outcome).
+fn pin_current_thread(core: usize) {
+    let ids = core_affinity::get_core_ids().unwrap_or_default();
+    match ids.into_iter().find(|c| c.id == core) {
+        Some(c) if core_affinity::set_for_current(c) => {
+            tracing::info!("hot-md thread pinned to core {core}");
+        }
+        Some(_) => tracing::warn!("failed to pin hot-md thread to core {core}"),
+        None => tracing::warn!("pin_hot_core={core} not present on this host; running unpinned"),
+    }
 }
 
 /// Wait for SIGINT or SIGTERM (so service stop also triggers the clean shutdown path).
@@ -903,6 +1095,13 @@ struct HotTask {
     capital_usage_percent: f64,
     /// Minimum order value (USD) for quota generation; folds into the size min-quote floor.
     min_order_value_usd: f64,
+    /// Positions worth less than this (USD) are treated as FLAT for quoting decisions
+    /// (Python `position_value_threshold_usd`; previously dead config).
+    position_dust_usd: f64,
+    /// vol_obi step_ns assumption (for the cadence-calibration log).
+    step_ns: i64,
+    cadence_start: Option<Instant>,
+    cadence_count: u64,
     /// Wall-clock warmup: suppress ALL quoting for this many seconds after start (Python
     /// `WARMUP_SECONDS`), except a reduce-only exit if already holding inventory.
     warmup_seconds: f64,
@@ -926,6 +1125,22 @@ struct HotTask {
     position_hold_until: Option<Instant>,
     position_hold: Duration,
     mid: f64,
+    /// Force-reconnect handle for the market-data WS: notified on a nonce gap or sanity
+    /// divergence so the session drops and resubscribes for a fresh snapshot.
+    md_reconnect: Arc<Notify>,
+    /// Set on a detected gap/divergence: deltas are ignored (and quoting suppressed) until
+    /// the next snapshot re-initializes the book — a diverged book must never price quotes.
+    awaiting_resnapshot: bool,
+    /// Per-message level scratch (reused; no per-tick allocation).
+    bid_scratch: Vec<(f64, f64)>,
+    ask_scratch: Vec<(f64, f64)>,
+    /// Last published tracked-id set (publish-on-change only).
+    last_tracked: Vec<i64>,
+    /// Last Lighter ticker BBO (same market) for the book-sanity cross-check.
+    ticker_bbo: Option<(f64, f64, Instant)>,
+    sanity_streak: u32,
+    /// Divergence threshold (bps) between book mid and ticker mid; <=0 disables the check.
+    sanity_bps: f64,
 }
 
 impl HotTask {
@@ -969,6 +1184,10 @@ impl HotTask {
             inv_bias: t.inventory_exit_bias.clone(),
             capital_usage_percent: t.capital_usage_percent,
             min_order_value_usd: t.min_order_value_usd,
+            position_dust_usd: t.position_value_threshold_usd.max(0.0),
+            step_ns: vo.step_ns.max(1),
+            cadence_start: None,
+            cadence_count: 0,
             warmup_seconds: vo.warmup_seconds,
             loop_start: None,
             reset_flag: Arc::new(AtomicBool::new(false)),
@@ -991,13 +1210,65 @@ impl HotTask {
             last_quote: None,
             last_seen_position: None,
             position_hold_until: None,
-            position_hold: Duration::from_secs_f64(
-                (config.safety.stale_order_poller_interval_sec.max(1.0)
-                    + POSITION_RECONCILE_SETTLE_BUFFER_SEC)
-                    .max(POSITION_RECONCILE_MIN_HOLD_SEC),
-            ),
+            // Post-fill settle window (Modify/Cancel suppression). Ids now resolve via the
+            // account_orders WS + Fill events rather than only the 3s REST poll, so this can
+            // be short (config; was a hardcoded >=10s full-ladder freeze).
+            position_hold: Duration::from_secs_f64(config.safety.position_change_hold_sec.max(0.0)),
             mid: 0.0,
+            md_reconnect: Arc::new(Notify::new()),
+            awaiting_resnapshot: false,
+            bid_scratch: Vec::with_capacity(256),
+            ask_scratch: Vec::with_capacity(256),
+            last_tracked: Vec::new(),
+            ticker_bbo: None,
+            sanity_streak: 0,
+            sanity_bps: config.safety.book_sanity_divergence_bps,
         }
+    }
+
+    /// Book can no longer be trusted (nonce gap / sanity divergence): stop quoting, drop any
+    /// pending unsent batch, and force the WS session to reconnect for a fresh snapshot.
+    fn request_resnapshot(&mut self) {
+        self.awaiting_resnapshot = true;
+        self.sanity_streak = 0;
+        self.md_reconnect.notify_one();
+        let _ = self.ops_tx.send(Vec::new());
+    }
+
+    /// True when the local book mid has diverged from the (fresh) ticker mid beyond the
+    /// configured threshold for several consecutive ticks — a symptom of a corrupted book
+    /// that nonce checking cannot catch (e.g. a bad snapshot).
+    fn book_sanity_diverged(&mut self, mid: f64) -> bool {
+        if self.sanity_bps <= 0.0 {
+            return false;
+        }
+        let Some((b, a, at)) = self.ticker_bbo else {
+            return false;
+        };
+        if at.elapsed() > SANITY_TICKER_FRESH {
+            return false;
+        }
+        let tmid = (b + a) * 0.5;
+        if tmid <= 0.0 {
+            return false;
+        }
+        let dev_bps = ((mid - tmid).abs() / tmid) * 10_000.0;
+        if dev_bps > self.sanity_bps {
+            self.sanity_streak += 1;
+            if self.sanity_streak >= SANITY_STREAK_TRIP {
+                tracing::warn!(
+                    "book sanity: mid {:.4} vs ticker {:.4} diverged {:.1}bps for {} ticks -> fresh snapshot",
+                    mid,
+                    tmid,
+                    dev_bps,
+                    self.sanity_streak
+                );
+                return true;
+            }
+        } else {
+            self.sanity_streak = 0;
+        }
+        false
     }
 
     fn hold_quotes_for_position_reconcile(&mut self, position: f64, now: Instant) -> bool {
@@ -1012,7 +1283,7 @@ impl HotTask {
                     notify.notify_one();
                 }
                 tracing::warn!(
-                    "position changed {:.8} -> {:.8}; holding quote updates for {:.2}s pending reconcile",
+                    "position changed {:.8} -> {:.8}; holding modify/cancel ops for {:.2}s pending reconcile (creates keep flowing)",
                     prev,
                     position,
                     self.position_hold.as_secs_f64()
@@ -1038,6 +1309,7 @@ impl HotTask {
         opts.recv_timeout = config.websocket.recv_timeout;
         opts.reconnect_base = config.websocket.reconnect_base_delay;
         opts.reconnect_max = config.websocket.reconnect_max_delay;
+        opts.ping_interval = config.websocket.ping_interval;
 
         // Start the wall-clock warmup window now (Python `_loop_start_time` at loop start).
         self.loop_start = Some(Instant::now());
@@ -1045,11 +1317,13 @@ impl HotTask {
         // tick discards stale book + vol/OBI state. Mirrors Python resetting the calc on DISCONNECT.
         let reset_flag = self.reset_flag.clone();
 
-        // The subscribe callback IS the synchronous hot path.
+        // The subscribe callback IS the synchronous hot path. The reconnect Notify lets the
+        // hot path force a fresh snapshot on nonce gaps / sanity divergence (1.2/1.3).
+        let md_reconnect = self.md_reconnect.clone();
         subscribe_loop(
             opts,
-            None,
-            |data| self.on_message(data),
+            Some(md_reconnect),
+            |mtype, raw| self.on_message(mtype, raw),
             move || {
                 reset_flag.store(true, Ordering::SeqCst);
             },
@@ -1057,15 +1331,21 @@ impl HotTask {
         .await;
     }
 
-    fn on_message(&mut self, data: &serde_json::Value) {
-        let mtype = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    /// The synchronous hot path: ONE typed deserialize per message, straight from the text.
+    fn on_message(&mut self, mtype: &str, raw: &str) {
         if mtype.contains("order_book") {
-            if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data.clone()) {
+            if let Ok(msg) = serde_json::from_str::<OrderBookMsg>(raw) {
                 self.on_orderbook(msg);
             }
         } else if mtype.contains("ticker") {
-            let _ = serde_json::from_value::<TickerMsg>(data.clone());
-            // ticker used for sanity only; ignored in shadow.
+            // Same-market BBO, kept for the book-sanity cross-check.
+            if let Ok(msg) = serde_json::from_str::<TickerMsg>(raw) {
+                if let (Some(b), Some(a)) = (msg.best_bid(), msg.best_ask()) {
+                    if b > 0.0 && a > b {
+                        self.ticker_bbo = Some((b, a, Instant::now()));
+                    }
+                }
+            }
         }
     }
 
@@ -1075,45 +1355,93 @@ impl HotTask {
         if self.reset_flag.swap(false, Ordering::SeqCst) {
             self.book = LocalBook::new();
             self.calc.reset();
+            self.awaiting_resnapshot = false;
+            self.sanity_streak = 0;
         }
 
-        // Offset stale-guard for deltas.
         let offset = msg.effective_offset();
         let is_snapshot = msg.is_snapshot();
-        if !is_snapshot {
+        if is_snapshot {
+            // A fresh snapshot re-initializes a diverged book.
+            self.awaiting_resnapshot = false;
+        } else {
+            // Book flagged diverged: ignore deltas until the reconnect delivers a snapshot.
+            if self.awaiting_resnapshot {
+                return;
+            }
+            // Offset stale-guard (secondary; offsets are NOT contiguous per Lighter docs).
             if let (Some(off), Some(last)) = (offset, self.book.last_offset) {
                 if self.book.initialized && off <= last {
                     return; // stale/out-of-order delta
                 }
             }
+            // Nonce continuity — the AUTHORITATIVE gap check (docs: current update's
+            // begin_nonce must equal the previous update's nonce). A gap means missed
+            // updates: the book is silently diverged and must be re-snapshotted.
+            if self.book.initialized {
+                if let (Some(bn), Some(last)) = (msg.effective_begin_nonce(), self.book.last_nonce)
+                {
+                    if bn != last {
+                        tracing::warn!(
+                            "order_book nonce gap: begin_nonce={bn} != last nonce={last} -> fresh snapshot"
+                        );
+                        self.request_resnapshot();
+                        return;
+                    }
+                }
+            }
         }
-        let bids: Vec<(f64, f64)> = msg.order_book.bids.iter().map(|l| l.parsed()).collect();
-        let asks: Vec<(f64, f64)> = msg.order_book.asks.iter().map(|l| l.parsed()).collect();
+        // Reused scratch buffers: levels are already f64 (parsed at deserialize time); this
+        // copy is allocation-free in steady state (capacity retained across messages).
+        self.bid_scratch.clear();
+        self.bid_scratch
+            .extend(msg.order_book.bids.iter().map(|l| (l.price, l.size)));
+        self.ask_scratch.clear();
+        self.ask_scratch
+            .extend(msg.order_book.asks.iter().map(|l| (l.price, l.size)));
         // Reset the vol/OBI calc ONLY on the FIRST snapshot of a connection (book not yet
         // initialized) — NOT on in-connection server snapshot refreshes, which would wipe the
         // accumulated volatility/OBI windows and re-trigger warmup (codex/audit: Python preserves
         // calc state across in-connection snapshots and resets only on disconnect, handled above).
         if is_snapshot || !self.book.initialized {
             let was_initialized = self.book.initialized;
-            self.book.apply_snapshot(bids, asks);
+            let (mut bids, mut asks) = (
+                std::mem::take(&mut self.bid_scratch),
+                std::mem::take(&mut self.ask_scratch),
+            );
+            self.book.apply_snapshot_scratch(&mut bids, &mut asks);
+            self.bid_scratch = bids;
+            self.ask_scratch = asks;
             if !was_initialized {
                 self.calc.reset();
             }
         } else {
-            self.book.apply_delta(&bids, &asks);
+            self.book.apply_delta(&self.bid_scratch, &self.ask_scratch);
         }
         if let Some(off) = offset {
             self.book.last_offset = Some(off);
         }
+        if let Some(n) = msg.effective_nonce() {
+            self.book.last_nonce = Some(n);
+        }
 
-        // Stamp market-data freshness (read by the sender as a WS-health proxy for pause recovery).
+        // Stamp market-data freshness (read by the sender as a WS-health proxy for pause
+        // recovery, and by the reconcile poller's dead-man switch).
         self.derived.set_md_now();
 
         // Hot signal update.
         if let Some(mid) = self.book.mid() {
+            if self.book_sanity_diverged(mid) {
+                self.request_resnapshot();
+                return;
+            }
             self.mid = mid;
+            // Publish the Lighter mid for the PnL actor (same-venue MTM; no Binance basis).
+            self.derived.set_mid(mid);
+            // ms-resolution wall clock is plenty for the 100ms sampling step.
+            let now_ns = crate::shared::now_ms() as i64 * 1_000_000;
             self.calc
-                .on_book_update(mid, &self.book.bids, &self.book.asks);
+                .on_book_update(now_ns, mid, &self.book.bids, &self.book.asks);
             self.maybe_quote();
         }
     }
@@ -1130,6 +1458,30 @@ impl HotTask {
 
         // Throttle the (heavier) quote+collect step to min_loop_interval.
         let now = Instant::now();
+
+        // Observed raw book-update rate vs the step_ns sampling clock. Informational only:
+        // the vol/OBI windows sample on the step clock (VolObiCalculator cadence gate), so a
+        // faster feed no longer mis-scales volatility — this log just shows the drop ratio.
+        self.cadence_count += 1;
+        match self.cadence_start {
+            None => self.cadence_start = Some(now),
+            Some(t0) => {
+                let elapsed = now.duration_since(t0).as_secs_f64();
+                if elapsed >= 60.0 {
+                    let observed_hz = self.cadence_count as f64 / elapsed;
+                    let assumed_hz = 1e9 / self.step_ns as f64;
+                    tracing::info!(
+                        target: "lighter_mm::cadence",
+                        "book update cadence: observed {:.2}/s vs step_ns-assumed {:.2}/s (vol_scale calibration)",
+                        observed_hz,
+                        assumed_hz
+                    );
+                    self.cadence_start = Some(now);
+                    self.cadence_count = 0;
+                }
+            }
+        }
+
         if let Some(t) = self.last_quote {
             if now.duration_since(t).as_secs_f64() < self.min_loop_interval {
                 return;
@@ -1144,25 +1496,40 @@ impl HotTask {
         // Live feed-readiness gate (codex #7): never quote before capital + position snapshots
         // have arrived, so we never quote (or decide reduce-only) on a stale/zero position. This
         // runs BEFORE the warmup/warmed checks so the reduce-only-during-warmup bypass below has a
-        // trustworthy position.
+        // trustworthy position. If the gate trips MID-RUN (capital exhausted / position feed
+        // lost) with a ladder resting, pull it — cancel-only batches pass the sender even while
+        // trading is paused; a stale frozen ladder must never keep resting.
         if self.mode == Mode::Live
             && (self.derived.capital() <= 0.0 || self.shared_pos.age_ms() == u64::MAX)
         {
-            let _ = self.ops_tx.send(Vec::new());
+            let cancels = self.om.collect_cancel_ops();
+            for op in &cancels {
+                self.om.mark_pending(op);
+            }
+            let _ = self.ops_tx.send(cancels);
             return;
         }
         let mid = self.mid;
-        let position = self.shared_pos.get();
+        let position_raw = self.shared_pos.get();
+        // Dust positions (value below the config threshold) are treated as FLAT for all
+        // quoting decisions — reduce-only flags, fallback exits, side suppression (Python
+        // `position_value_threshold_usd`; previously dead config).
+        let position = if position_raw.abs() * mid < self.position_dust_usd {
+            0.0
+        } else {
+            position_raw
+        };
         let capital = self.derived.capital();
         let tick = self.market.price_tick;
-        if self.hold_quotes_for_position_reconcile(position, now) {
-            let _ = self.ops_tx.send(Vec::new());
-            return;
-        }
+        // Post-fill settle window: suppress Modify/Cancel ops (their exchange ids are
+        // unverified until fills/reconcile land) but KEEP quoting — Creates still flow, so a
+        // just-filled level re-quotes immediately instead of freezing the whole ladder.
+        // Detection uses the RAW position so every real change arms the window.
+        let hold_mutations = self.hold_quotes_for_position_reconcile(position_raw, now);
 
         // Capital-derived dynamic order size (Python `calculate_dynamic_base_amount`): a fixed
         // fraction of capital * leverage / mid, normalized to exchange minimums. Falls back to the
-        // static seed when capital is unknown (shadow). `capital_usage_percent` was dead config.
+        // static seed when capital is unknown (dry-run). `capital_usage_percent` was dead config.
         let order_size = if capital > 0.0 {
             let raw = capital * self.capital_usage_percent * (self.leverage as f64) / mid;
             let min_quote = self.market.min_quote_amount.max(self.min_order_value_usd);
@@ -1208,7 +1575,7 @@ impl HotTask {
         // `WARMUP_SECONDS`, live only). In both cases we suppress normal quotes but STILL emit a
         // passive reduce-only exit if we hold inventory (Python: reduce-only bypass works even
         // before the calc is warmed, since the exit is a fixed-bps fallback that needs no vol/OBI).
-        // Shadow has no wall-clock warmup so it stays a fast verification tool.
+        // Dry-run has no wall-clock warmup so it stays a fast verification tool.
         let in_wallclock_warmup = self.mode == Mode::Live
             && self
                 .loop_start
@@ -1216,10 +1583,22 @@ impl HotTask {
                 .unwrap_or(true);
         let not_ready = !self.calc.warmed_up() || in_wallclock_warmup;
 
-        let levels = if not_ready {
+        let (levels, quote_size) = if not_ready {
             if position.abs() >= crate::strategy::quotes::EPSILON {
-                // Holding inventory while not ready -> quote only a passive reduce-only exit.
-                fallback_reduce_only(mid, position, tick, self.fallback_bps, self.num_levels)
+                // Holding inventory while not ready -> quote only a passive reduce-only exit,
+                // sized to the ACTUAL inventory (the exchange clips reduce-only excess anyway;
+                // matching the position avoids the leftover-remainder churn).
+                let exit_size = normalize_live_order_size(
+                    order_size.min(position.abs()),
+                    mid,
+                    self.market.amount_tick,
+                    self.market.min_base_amount,
+                    self.market.min_quote_amount.max(self.min_order_value_usd),
+                );
+                (
+                    fallback_reduce_only(mid, position, tick, self.fallback_bps, self.num_levels),
+                    exit_size,
+                )
             } else {
                 // Flat and not ready -> no quotes at all.
                 let _ = self.ops_tx.send(Vec::new());
@@ -1237,11 +1616,12 @@ impl HotTask {
                 &self.factors,
                 self.fallback_bps,
             );
-            // Quality multiplier + inventory-exit bias. The live-metrics adverse-selection quality
-            // loop is NOT used in the Python production path, so neutral 1.0 / 0.0 is correct parity.
-            lv = apply_quality_spread_multiplier(&lv, mid, 1.0, tick);
-            lv = apply_inventory_exit_bias(
-                &lv,
+            // Quality multiplier + inventory-exit bias (in place, no Vec churn). The
+            // live-metrics adverse-selection quality loop is NOT used in the Python
+            // production path, so neutral 1.0 / 0.0 is correct parity.
+            apply_quality_spread_multiplier(&mut lv, mid, 1.0, tick);
+            apply_inventory_exit_bias(
+                &mut lv,
                 mid,
                 position,
                 max_pos_usd,
@@ -1250,12 +1630,17 @@ impl HotTask {
                 &self.inv_bias,
                 tick,
             );
-            lv
+            (lv, order_size)
         };
 
-        let ops =
-            self.om
-                .collect_order_operations(&levels, order_size, position, threshold_bps, now_ns);
+        let ops = self.om.collect_order_operations(
+            &levels,
+            quote_size,
+            position,
+            threshold_bps,
+            now_ns,
+            hold_mutations,
+        );
 
         // KEYSTONE: occupy slots the instant ops are emitted (before signing/sending) so the
         // next quote cycle's collect can never duplicate an in-flight order. On send failure
@@ -1263,15 +1648,43 @@ impl HotTask {
         for op in &ops {
             self.om.mark_pending(op);
         }
-        // Publish tracked client-ids for the reconcile poller's orphan check.
-        self.tracked_ids
-            .store(Arc::new(self.om.tracked_client_ids()));
+        // Publish tracked client-ids for the reconcile poller's orphan check (on change only —
+        // steady-state cycles skip the Vec + Arc allocation).
+        if !self.om.tracked_ids_equal(&self.last_tracked) {
+            let tracked = self.om.tracked_client_ids();
+            self.tracked_ids.store(Arc::new(tracked.clone()));
+            self.last_tracked = tracked;
+        }
 
         match self.mode {
-            Mode::Shadow => {
+            Mode::DryRun => {
+                // Simulate the sender's optimistic bind with fake exchange ids so dry-run
+                // exercises the modify/cancel flow — previously every slot froze in
+                // `Placing` forever and `ops` decayed to 0 after the first batch.
+                for op in &ops {
+                    match op.action {
+                        OrderAction::Create | OrderAction::Modify => {
+                            self.om.apply_event(OrderEvent::BindLive {
+                                side: op.side,
+                                level: op.level,
+                                client_order_id: op.client_order_id,
+                                exchange_id: Some(op.exchange_id.unwrap_or(op.client_order_id)),
+                                price: op.price,
+                                size: op.size,
+                            });
+                        }
+                        OrderAction::Cancel => {
+                            self.om.apply_event(OrderEvent::ClearLive {
+                                side: op.side,
+                                level: op.level,
+                                client_order_id: op.client_order_id,
+                            });
+                        }
+                    }
+                }
                 if let Some((b, a)) = levels.first().copied() {
                     tracing::info!(
-                        "SHADOW vol={:.6} alpha={:.4} mid={:.4} L0_bid={:?} L0_ask={:?} ops={}",
+                        "DRY-RUN vol={:.6} alpha={:.4} mid={:.4} L0_bid={:?} L0_ask={:?} ops={}",
                         self.calc.volatility(),
                         self.calc.alpha(),
                         mid,

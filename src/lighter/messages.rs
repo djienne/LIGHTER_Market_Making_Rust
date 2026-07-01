@@ -94,18 +94,49 @@ impl RemoteOrder {
 
 // ----------------------------- WebSocket -----------------------------
 
-/// A single order book level (strings on the wire).
-#[derive(Debug, Deserialize, Clone)]
+/// A single order book level, parsed to f64 AT DESERIALIZE TIME. Prices/sizes arrive as JSON
+/// strings; materializing them as `String` allocated two heap strings per level per message
+/// on the hot path — this visitor parses straight from the borrowed text instead.
+#[derive(Debug, Deserialize, Clone, Copy)]
 pub struct PriceLevel {
-    pub price: String,
-    pub size: String,
+    #[serde(deserialize_with = "de_f64_flex")]
+    pub price: f64,
+    #[serde(deserialize_with = "de_f64_flex")]
+    pub size: f64,
 }
 
 impl PriceLevel {
     #[inline]
     pub fn parsed(&self) -> (f64, f64) {
-        (parse_f64(&self.price), parse_f64(&self.size))
+        (self.price, self.size)
     }
+}
+
+/// Deserialize an f64 from either a JSON numeric string (Lighter's wire format) or a number.
+fn de_f64_flex<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = f64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("number or numeric string")
+        }
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<f64, E> {
+            Ok(fast_float::parse(s).unwrap_or(0.0))
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f64, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+    }
+    d.deserialize_any(V)
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +147,10 @@ pub struct OrderBookPayload {
     pub asks: Vec<PriceLevel>,
     #[serde(default)]
     pub offset: Option<u64>,
+    #[serde(default)]
+    pub nonce: Option<i64>,
+    #[serde(default)]
+    pub begin_nonce: Option<i64>,
 }
 
 /// `order_book/{m}` envelope. `type` is `subscribed/order_book` (snapshot) or
@@ -126,6 +161,10 @@ pub struct OrderBookMsg {
     pub msg_type: String,
     #[serde(default)]
     pub offset: Option<u64>,
+    #[serde(default)]
+    pub nonce: Option<i64>,
+    #[serde(default)]
+    pub begin_nonce: Option<i64>,
     pub order_book: OrderBookPayload,
 }
 
@@ -136,6 +175,16 @@ impl OrderBookMsg {
     /// Prefer envelope offset, fall back to payload offset.
     pub fn effective_offset(&self) -> Option<u64> {
         self.offset.or(self.order_book.offset)
+    }
+    /// Matching-engine nonce of this update (docs: gap detection compares the NEXT update's
+    /// `begin_nonce` against this). Envelope first, payload fallback.
+    pub fn effective_nonce(&self) -> Option<i64> {
+        self.nonce.or(self.order_book.nonce)
+    }
+    /// First nonce covered by this update; must equal the previous update's `nonce` or
+    /// updates were missed (the `offset` field is explicitly NOT contiguous per Lighter docs).
+    pub fn effective_begin_nonce(&self) -> Option<i64> {
+        self.begin_nonce.or(self.order_book.begin_nonce)
     }
 }
 

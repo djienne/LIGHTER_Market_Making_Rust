@@ -68,6 +68,24 @@ fn main() -> Result<()> {
     println!("tx_type = {}", tx.tx_type);
     println!("tx_hash = {}", tx.tx_hash);
     println!("tx_info = {}", tx.tx_info);
+
+    // FFI arity check for SignUpdateLeverage against the SHIPPED signer binary (offline, not
+    // sent). Newer SDK builds added a skip_nonce param; a silent arity mismatch through C FFI
+    // is UB, so the startup update-leverage path (orchestrator) must not ship unverified.
+    // Expect tx_type/tx_info to print sanely; a crash/garbage here means the binding is stale.
+    let lev = signer
+        .sign_update_leverage(
+            MARKET_INDEX,
+            5000, // imf = 10000/leverage for 2x
+            lighter_mm::lighter::signer::MARGIN_MODE_CROSS,
+            NONCE,
+            api_key_index,
+        )
+        .context("sign_update_leverage")?;
+    println!("--- RUST SIGNED UPDATE-LEVERAGE ---");
+    println!("tx_type = {}", lev.tx_type);
+    println!("tx_hash = {}", lev.tx_hash);
+    println!("tx_info = {}", lev.tx_info);
     Ok(())
 }
 

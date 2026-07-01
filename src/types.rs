@@ -123,6 +123,20 @@ pub enum OrderEvent {
     },
     /// Clear all slots (e.g. cancel-all).
     ClearAll,
+    /// Client->exchange id mapping resolved (account_orders WS). Mapping ONLY — must never
+    /// touch slot state (incremental WS deltas clearing slots was codex #1's duplicate-create
+    /// bug). Cuts create->modifiable latency from the ~3s REST reconcile poll to ~100ms.
+    IdResolved {
+        client_order_id: i64,
+        exchange_id: i64,
+    },
+    /// Own fill observed on the account stream: clear the slot on a full fill (level
+    /// re-quotes immediately instead of waiting for reconcile debounce), shrink it on a
+    /// partial fill.
+    Fill {
+        client_order_id: i64,
+        filled_size: f64,
+    },
 }
 
 /// Static per-market config resolved from REST at startup.

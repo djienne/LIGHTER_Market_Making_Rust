@@ -5,10 +5,11 @@
 //! appends audit rows to CSV, and periodically writes a compact session summary.
 
 use crate::account::fill_accounting::FillAccounting;
+use crate::account::persistence::{LiveState, LiveStateStore};
 use crate::config::PnlCfg;
 use crate::lighter::messages::TradePayload;
 use crate::metrics::trade_log::{TradeLogger, TradeRow};
-use crate::shared::SharedBbo;
+use crate::shared::{Derived, SharedBbo};
 use crate::types::Side;
 use chrono::{SecondsFormat, TimeZone, Utc};
 use serde::Serialize;
@@ -23,6 +24,9 @@ use tokio::sync::mpsc;
 const EPSILON: f64 = 1e-9;
 const PENDING_LIMIT: usize = 2_000;
 const MID_FRESH_MS: u64 = 10_000;
+/// Cap on the seen-trade / strategy-client id sets (FIFO eviction) — a continuously
+/// re-quoting maker previously grew both without bound.
+const ID_SET_CAP: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub enum PnlEvent {
@@ -55,9 +59,16 @@ pub struct PnlSummary {
     pub strategy_realized_pnl_usdc: f64,
     pub strategy_unrealized_pnl_usdc: f64,
     pub strategy_mtm_pnl_usdc: f64,
+    /// Realized PnL from account fills that could not be attributed to this strategy
+    /// (no client id: liquidations, manual orders). Tracked separately so it is neither
+    /// silently dropped nor mixed into strategy PnL.
+    pub unattributed_realized_pnl_usdc: f64,
     pub open_position_base: f64,
     pub entry_vwap: f64,
     pub last_mid: Option<f64>,
+    /// True when both the Lighter and Binance mid feeds are stale — unrealized/MTM carry
+    /// the last computed value instead of silently marking against an old price.
+    pub mid_stale: bool,
     pub fill_count: u64,
     pub buy_count: u64,
     pub sell_count: u64,
@@ -78,15 +89,25 @@ pub struct PnlActor {
     session_id: String,
     started_at: String,
     shared_bbo: Arc<SharedBbo>,
+    /// Lighter-side mid + freshness (published by the hot task) — preferred MTM source.
+    derived: Arc<Derived>,
     trade_logger: TradeLogger,
+    state_store: LiveStateStore,
     summary_path: PathBuf,
     snapshots_path: PathBuf,
     accounting: FillAccounting,
     strategy_client_ids: HashSet<i64>,
+    strategy_client_order: VecDeque<i64>,
     seen_trade_ids: HashSet<i64>,
+    seen_trade_order: VecDeque<i64>,
     pending_trade_ids: HashSet<i64>,
-    pending: VecDeque<TradePayload>,
+    /// Pending trades carry the accounting sync-generation at queue time: a trade queued
+    /// BEFORE a position-snapshot re-seed is already included in that snapshot, so its
+    /// replay must attribute PnL only and never re-apply position/fees (double-count bug).
+    pending: VecDeque<(TradePayload, u64)>,
+    sync_generation: u64,
     strategy_realized_pnl_usdc: f64,
+    unattributed_realized_pnl_usdc: f64,
     fill_count: u64,
     buy_count: u64,
     sell_count: u64,
@@ -99,6 +120,8 @@ pub struct PnlActor {
     available_capital: Option<f64>,
     portfolio_value: Option<f64>,
     last_mid: Option<f64>,
+    mid_stale: bool,
+    last_unrealized: f64,
 }
 
 impl PnlActor {
@@ -109,16 +132,50 @@ impl PnlActor {
         account_index: i64,
         maker_fee_rate: f64,
         shared_bbo: Arc<SharedBbo>,
+        derived: Arc<Derived>,
     ) -> std::io::Result<Self> {
         let dir = PathBuf::from(&cfg.persist_dir);
         fs::create_dir_all(&dir)?;
         let trade_logger = TradeLogger::new(&dir, &symbol)?;
+        let state_store = LiveStateStore::new(&dir, &symbol);
         let session_stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let session_id = format!("{symbol}-{market_id}-{session_stamp}");
         let summary_path = dir.join(format!("pnl_session_{symbol}.json"));
         let snapshots_path = dir.join(format!("pnl_snapshots_{symbol}.csv"));
         ensure_snapshot_header(&snapshots_path)?;
         let started_at = utc_now();
+
+        // Restart durability: restore cumulative realized/fills/notional + the local
+        // accounting estimate from the persisted live state (only when it belongs to this
+        // account+market). The exchange snapshot remains authoritative at runtime.
+        let restored = state_store.load();
+        let restore = restored.account_index == account_index
+            && restored.market_id == market_id
+            && !restored.updated_at.is_empty();
+        let (accounting, realized, fills, notional) = if restore {
+            tracing::info!(
+                "PNL_RESTORE symbol={symbol} realized={:.6} fills={} notional={:.6} pos_est={:.8} (saved {})",
+                restored.realized_pnl_cumulative,
+                restored.fill_count,
+                restored.volume_usd,
+                restored.position_size_est,
+                restored.updated_at
+            );
+            (
+                FillAccounting::from_snapshot(
+                    maker_fee_rate,
+                    restored.position_size_est,
+                    restored.entry_vwap,
+                    restored.realized_pnl_cumulative,
+                ),
+                restored.realized_pnl_cumulative,
+                restored.fill_count,
+                restored.volume_usd,
+            )
+        } else {
+            (FillAccounting::new(maker_fee_rate), 0.0, 0, 0.0)
+        };
+
         let mut actor = Self {
             cfg,
             symbol,
@@ -128,19 +185,25 @@ impl PnlActor {
             session_id,
             started_at,
             shared_bbo,
+            derived,
             trade_logger,
+            state_store,
             summary_path,
             snapshots_path,
-            accounting: FillAccounting::new(maker_fee_rate),
+            accounting,
             strategy_client_ids: HashSet::new(),
+            strategy_client_order: VecDeque::new(),
             seen_trade_ids: HashSet::new(),
+            seen_trade_order: VecDeque::new(),
             pending_trade_ids: HashSet::new(),
             pending: VecDeque::new(),
-            strategy_realized_pnl_usdc: 0.0,
-            fill_count: 0,
+            sync_generation: 0,
+            strategy_realized_pnl_usdc: realized,
+            unattributed_realized_pnl_usdc: 0.0,
+            fill_count: fills,
             buy_count: 0,
             sell_count: 0,
-            notional_usdc: 0.0,
+            notional_usdc: notional,
             duplicate_fill_count: 0,
             unattributed_fill_count: 0,
             exchange_position_seen: false,
@@ -149,6 +212,8 @@ impl PnlActor {
             available_capital: None,
             portfolio_value: None,
             last_mid: None,
+            mid_stale: false,
+            last_unrealized: 0.0,
         };
         actor.persist_summary();
         Ok(actor)
@@ -168,21 +233,30 @@ impl PnlActor {
         tick.tick().await;
         loop {
             tokio::select! {
-                Some(evt) = rx.recv() => {
+                evt = rx.recv() => {
+                    // Match on the Option so a closed channel EXITS the loop — the old
+                    // `Some(evt) = rx.recv()` pattern merely disabled this arm on close
+                    // while the tick arm kept the actor alive as a zombie forever.
+                    let Some(evt) = evt else {
+                        self.flush_all();
+                        break;
+                    };
                     if matches!(evt, PnlEvent::Shutdown) {
                         self.flush_all();
                         let s = self.summary();
                         tracing::info!(
-                            "PNL_SUMMARY session_id={} realized={:.6} mtm={:.6} unrealized={:.6} fills={} notional={:.6} open_pos={:.8} entry_vwap={:.4} mid={:?}",
+                            "PNL_SUMMARY session_id={} realized={:.6} mtm={:.6} unrealized={:.6} unattributed={:.6} fills={} notional={:.6} open_pos={:.8} entry_vwap={:.4} mid={:?} mid_stale={}",
                             s.session_id,
                             s.strategy_realized_pnl_usdc,
                             s.strategy_mtm_pnl_usdc,
                             s.strategy_unrealized_pnl_usdc,
+                            s.unattributed_realized_pnl_usdc,
                             s.fill_count,
                             s.notional_usdc,
                             s.open_position_base,
                             s.entry_vwap,
-                            s.last_mid
+                            s.last_mid,
+                            s.mid_stale
                         );
                         break;
                     }
@@ -192,22 +266,20 @@ impl PnlActor {
                     self.flush_all();
                     let s = self.summary();
                     tracing::info!(
-                        "PNL_HEALTH session_id={} realized={:.6} mtm={:.6} unrealized={:.6} fills={} notional={:.6} open_pos={:.8} entry_vwap={:.4} mid={:?} pending_unattributed={}",
+                        "PNL_HEALTH session_id={} realized={:.6} mtm={:.6} unrealized={:.6} unattributed={:.6} fills={} notional={:.6} open_pos={:.8} entry_vwap={:.4} mid={:?} mid_stale={} pending_unattributed={}",
                         s.session_id,
                         s.strategy_realized_pnl_usdc,
                         s.strategy_mtm_pnl_usdc,
                         s.strategy_unrealized_pnl_usdc,
+                        s.unattributed_realized_pnl_usdc,
                         s.fill_count,
                         s.notional_usdc,
                         s.open_position_base,
                         s.entry_vwap,
                         s.last_mid,
+                        s.mid_stale,
                         s.pending_unattributed_fill_count
                     );
-                }
-                else => {
-                    self.flush_all();
-                    break;
                 }
             }
         }
@@ -217,8 +289,13 @@ impl PnlActor {
         match evt {
             PnlEvent::RegisterClientIds(ids) => {
                 for id in ids {
-                    if id > 0 {
-                        self.strategy_client_ids.insert(id);
+                    if id > 0 && self.strategy_client_ids.insert(id) {
+                        self.strategy_client_order.push_back(id);
+                        while self.strategy_client_order.len() > ID_SET_CAP {
+                            if let Some(old) = self.strategy_client_order.pop_front() {
+                                self.strategy_client_ids.remove(&old);
+                            }
+                        }
                     }
                 }
                 self.retry_pending();
@@ -258,6 +335,22 @@ impl PnlActor {
                 p.entry_vwap.unwrap_or(0.0),
                 self.strategy_realized_pnl_usdc,
             );
+            // Bump the sync generation: trades queued BEFORE this snapshot are already
+            // included in it — their eventual replay must be PnL-attribution-only and
+            // never re-apply position/fees (the double-count bug).
+            self.sync_generation += 1;
+        }
+    }
+
+    /// Mark a trade id as processed, with FIFO-bounded memory.
+    fn mark_seen(&mut self, trade_id: i64) {
+        if self.seen_trade_ids.insert(trade_id) {
+            self.seen_trade_order.push_back(trade_id);
+            while self.seen_trade_order.len() > ID_SET_CAP {
+                if let Some(old) = self.seen_trade_order.pop_front() {
+                    self.seen_trade_ids.remove(&old);
+                }
+            }
         }
     }
 
@@ -277,13 +370,14 @@ impl PnlActor {
         if self.pending_trade_ids.contains(&trade_id) {
             return;
         }
-        match self.try_accept_trade(&trade) {
+        let generation = self.sync_generation;
+        match self.try_accept_trade(&trade, generation) {
             TradeDecision::Accepted => {}
             TradeDecision::PendingClientId(client_id) => {
                 self.pending_trade_ids.insert(trade_id);
-                self.pending.push_back(trade);
+                self.pending.push_back((trade, generation));
                 while self.pending.len() > PENDING_LIMIT {
-                    if let Some(old) = self.pending.pop_front() {
+                    if let Some((old, _)) = self.pending.pop_front() {
                         if let Some(id) = old.trade_id {
                             self.pending_trade_ids.remove(&id);
                         }
@@ -308,17 +402,17 @@ impl PnlActor {
             return;
         }
         let mut still_pending = VecDeque::new();
-        while let Some(trade) = self.pending.pop_front() {
+        while let Some((trade, generation)) = self.pending.pop_front() {
             if let Some(id) = trade.trade_id {
                 self.pending_trade_ids.remove(&id);
             }
-            match self.try_accept_trade(&trade) {
+            match self.try_accept_trade(&trade, generation) {
                 TradeDecision::Accepted => {}
                 TradeDecision::PendingClientId(_) => {
                     if let Some(id) = trade.trade_id {
                         self.pending_trade_ids.insert(id);
                     }
-                    still_pending.push_back(trade);
+                    still_pending.push_back((trade, generation));
                 }
                 TradeDecision::Skipped(reason) => {
                     self.unattributed_fill_count += 1;
@@ -329,7 +423,7 @@ impl PnlActor {
         self.pending = still_pending;
     }
 
-    fn try_accept_trade(&mut self, trade: &TradePayload) -> TradeDecision {
+    fn try_accept_trade(&mut self, trade: &TradePayload, queued_generation: u64) -> TradeDecision {
         let trade_id = match trade.trade_id {
             Some(id) => id,
             None => return TradeDecision::Skipped("missing_trade_id"),
@@ -345,15 +439,32 @@ impl PnlActor {
         if fill.price <= 0.0 || fill.size <= 0.0 {
             return TradeDecision::Skipped("invalid_price_or_size");
         }
-        let is_known_strategy = self.strategy_client_ids.contains(&fill.client_order_id);
-        if !is_known_strategy && !self.cfg.include_unattributed_account_fills {
-            return TradeDecision::PendingClientId(fill.client_order_id);
+        let is_known_strategy = fill
+            .client_order_id
+            .is_some_and(|c| self.strategy_client_ids.contains(&c));
+        let attribute_to_strategy = is_known_strategy || self.cfg.include_unattributed_account_fills;
+        if !attribute_to_strategy {
+            if let Some(cid) = fill.client_order_id {
+                // Our order, id not yet registered by the sender: queue for replay.
+                return TradeDecision::PendingClientId(cid);
+            }
+            // No client id at all (liquidation / manual order / venue omission): it can never
+            // be attributed later, but the account UNQUESTIONABLY traded — fall through and
+            // book it now (position accounting + the unattributed PnL bucket) instead of the
+            // old behavior of silently dropping it as "account_not_in_trade".
         }
 
-        let local = self.accounting.apply(fill.side, fill.price, fill.size);
-        let local_delta = local.realized_delta;
+        // A trade queued before the last position-snapshot re-seed is ALREADY reflected in
+        // the snapshot: attribute its PnL but never re-apply position/fees (double-count bug).
+        let superseded = queued_generation < self.sync_generation;
+        let (local_delta, fee_usd) = if superseded {
+            (fill.exchange_pnl.unwrap_or(0.0), 0.0)
+        } else {
+            let local = self.accounting.apply(fill.side, fill.price, fill.size);
+            (local.realized_delta, local.fee_usd)
+        };
         let realized_delta = fill.exchange_pnl.unwrap_or(local_delta);
-        if let Some(exchange_delta) = fill.exchange_pnl {
+        if let (Some(exchange_delta), false) = (fill.exchange_pnl, superseded) {
             if (exchange_delta - local_delta).abs() > 0.01 {
                 tracing::warn!(
                     "PNL_LOCAL_MISMATCH trade_id={} exchange_delta={:.6} local_delta={:.6}",
@@ -364,8 +475,13 @@ impl PnlActor {
             }
         }
 
-        self.seen_trade_ids.insert(trade_id);
-        self.strategy_realized_pnl_usdc += realized_delta;
+        self.mark_seen(trade_id);
+        if attribute_to_strategy {
+            self.strategy_realized_pnl_usdc += realized_delta;
+        } else {
+            self.unattributed_realized_pnl_usdc += realized_delta;
+            self.unattributed_fill_count += 1;
+        }
         self.fill_count += 1;
         match fill.side {
             Side::Buy => self.buy_count += 1,
@@ -391,22 +507,22 @@ impl PnlActor {
             portfolio_value: self.portfolio_value.unwrap_or(0.0),
             simulated: false,
             notional_usd: Some(fill.notional_usd),
-            fee_usd: Some(local.fee_usd),
+            fee_usd: Some(fee_usd),
             entry_vwap_after: Some(self.accounting.entry_vwap()),
             realized_pnl_cumulative: Some(self.strategy_realized_pnl_usdc),
             mid_at_fill,
             spread_capture_bps,
             inventory_after_usd,
-            client_order_index: Some(fill.client_order_id.to_string()),
+            client_order_index: fill.client_order_id.map(|c| c.to_string()),
             exchange_order_index: fill.exchange_order_id.map(|id| id.to_string()),
-            fill_source: if is_known_strategy {
-                "account_all".to_string()
-            } else {
-                "account_all_unattributed".to_string()
+            fill_source: match (is_known_strategy, superseded) {
+                (true, false) => "account_all".to_string(),
+                (true, true) => "account_all_late_attributed".to_string(),
+                (false, _) => "account_all_unattributed".to_string(),
             },
         });
         tracing::info!(
-            "PNL_FILL session_id={} trade_id={} side={} price={:.4} size={:.8} notional={:.6} realized_delta={:.6} realized_cum={:.6} client_id={} exchange_id={:?}",
+            "PNL_FILL session_id={} trade_id={} side={} price={:.4} size={:.8} notional={:.6} realized_delta={:.6} realized_cum={:.6} client_id={:?} exchange_id={:?} superseded={}",
             self.session_id,
             trade_id,
             fill.side,
@@ -416,16 +532,28 @@ impl PnlActor {
             realized_delta,
             self.strategy_realized_pnl_usdc,
             fill.client_order_id,
-            fill.exchange_order_id
+            fill.exchange_order_id,
+            superseded
         );
-        self.persist_summary();
         TradeDecision::Accepted
     }
 
+    /// Refresh the MTM mid: prefer the Lighter mid (same venue, hot-task-published), fall
+    /// back to the Binance BBO; if BOTH are stale, keep the last value but flag it stale so
+    /// unrealized/MTM figures are never silently marked against an old price.
     fn refresh_mid(&mut self) {
+        let lighter_mid = self.derived.mid();
+        if lighter_mid > 0.0 && self.derived.md_age_ms() <= MID_FRESH_MS {
+            self.last_mid = Some(lighter_mid);
+            self.mid_stale = false;
+            return;
+        }
         let mid = self.shared_bbo.mid();
         if mid > 0.0 && self.shared_bbo.age_ms() <= MID_FRESH_MS {
             self.last_mid = Some(mid);
+            self.mid_stale = false;
+        } else if self.last_mid.is_some() {
+            self.mid_stale = true;
         }
     }
 
@@ -460,7 +588,15 @@ impl PnlActor {
 
     fn summary(&mut self) -> PnlSummary {
         self.refresh_mid();
-        let unrealized = self.unrealized_pnl();
+        // With a stale mid, carry the last computed unrealized value (flagged) instead of
+        // recomputing against an arbitrarily old price.
+        let unrealized = if self.mid_stale {
+            self.last_unrealized
+        } else {
+            let u = self.unrealized_pnl();
+            self.last_unrealized = u;
+            u
+        };
         PnlSummary {
             session_id: self.session_id.clone(),
             symbol: self.symbol.clone(),
@@ -471,9 +607,11 @@ impl PnlActor {
             strategy_realized_pnl_usdc: self.strategy_realized_pnl_usdc,
             strategy_unrealized_pnl_usdc: unrealized,
             strategy_mtm_pnl_usdc: self.strategy_realized_pnl_usdc + unrealized,
+            unattributed_realized_pnl_usdc: self.unattributed_realized_pnl_usdc,
             open_position_base: self.open_position(),
             entry_vwap: self.entry_vwap(),
             last_mid: self.last_mid,
+            mid_stale: self.mid_stale,
             fill_count: self.fill_count,
             buy_count: self.buy_count,
             sell_count: self.sell_count,
@@ -493,6 +631,25 @@ impl PnlActor {
         }
     }
 
+    /// Durable restart state for [`LiveStateStore`].
+    fn live_state(&self) -> LiveState {
+        LiveState {
+            account_index: self.account_index,
+            market_id: self.market_id,
+            position_size_est: self.accounting.position_size(),
+            entry_vwap: self.accounting.entry_vwap(),
+            realized_pnl_cumulative: self.strategy_realized_pnl_usdc,
+            fill_count: self.fill_count,
+            volume_usd: self.notional_usdc,
+            exchange_position_size: self.exchange_position,
+            exchange_entry_vwap: self.exchange_entry_vwap,
+            portfolio_value: self.portfolio_value.unwrap_or(0.0),
+            available_capital: self.available_capital.unwrap_or(0.0),
+            symbol: String::new(),     // stamped by the store
+            updated_at: String::new(), // stamped by the store
+        }
+    }
+
     fn flush_all(&mut self) {
         if let Err(e) = self.trade_logger.flush() {
             tracing::warn!("PNL trade log flush failed: {e}");
@@ -503,6 +660,9 @@ impl PnlActor {
         }
         if let Err(e) = atomic_json_write(&self.summary_path, &summary) {
             tracing::warn!("PNL summary write failed: {e}");
+        }
+        if let Err(e) = self.state_store.save(&self.live_state()) {
+            tracing::warn!("PNL live-state save failed: {e}");
         }
     }
 }
@@ -520,7 +680,9 @@ struct FillView {
     price: f64,
     size: f64,
     notional_usd: f64,
-    client_order_id: i64,
+    /// May be absent (liquidations, manual orders, venue payload omission) — membership is
+    /// decided by ACCOUNT id, so such fills are still ours and must still be booked.
+    client_order_id: Option<i64>,
     exchange_order_id: Option<i64>,
     exchange_pnl: Option<f64>,
 }
@@ -536,7 +698,7 @@ impl FillView {
                 price,
                 size,
                 notional_usd,
-                client_order_id: trade.ask_client_id?,
+                client_order_id: trade.ask_client_id,
                 exchange_order_id: trade.ask_id,
                 exchange_pnl: trade.ask_account_pnl_f64(),
             })
@@ -546,7 +708,7 @@ impl FillView {
                 price,
                 size,
                 notional_usd,
-                client_order_id: trade.bid_client_id?,
+                client_order_id: trade.bid_client_id,
                 exchange_order_id: trade.bid_id,
                 exchange_pnl: trade.bid_account_pnl_f64(),
             })
@@ -701,6 +863,7 @@ mod tests {
             7,
             0.0,
             Arc::new(SharedBbo::new(1)),
+            Arc::new(Derived::new()),
         )
         .unwrap()
     }
@@ -778,6 +941,69 @@ mod tests {
         });
         assert_eq!(a.fill_count, 1);
         assert_eq!(a.duplicate_fill_count, 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn books_account_fill_without_client_id_as_unattributed() {
+        let dir = temp_dir("no_cid");
+        let mut a = actor(&dir);
+        // Liquidation/manual-order shape: our account id, no client id. The old code dropped
+        // this as "account_not_in_trade"; it must be booked (position + unattributed bucket).
+        let mut t = trade(1, 42, Side::Buy, Some("0.75"));
+        t.bid_client_id = None;
+        a.handle_event(PnlEvent::AccountAll {
+            position: None,
+            trades: vec![t],
+        });
+        assert_eq!(a.fill_count, 1);
+        assert_eq!(a.unattributed_fill_count, 1);
+        assert!((a.unattributed_realized_pnl_usdc - 0.75).abs() < 1e-12);
+        assert!(a.strategy_realized_pnl_usdc.abs() < 1e-12);
+        assert!((a.accounting.position_size() - 0.5).abs() < 1e-12);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_fill_superseded_by_snapshot_does_not_double_apply() {
+        let dir = temp_dir("superseded");
+        let mut a = actor(&dir);
+        // Fill races RegisterClientIds -> queued pending; the SAME message's position
+        // snapshot already includes it (position 0.5) and re-seeds accounting.
+        a.handle_event(PnlEvent::AccountAll {
+            position: Some(PositionSnapshot {
+                signed_position: 0.5,
+                entry_vwap: Some(100.0),
+            }),
+            trades: vec![trade(1, 42, Side::Buy, None)],
+        });
+        assert_eq!(a.pending.len(), 1);
+        assert!((a.accounting.position_size() - 0.5).abs() < 1e-12);
+        // Late registration: PnL-attribution only — position must NOT double to 1.0
+        // (the old replay re-applied the fill on top of the synced snapshot).
+        a.handle_event(PnlEvent::RegisterClientIds(vec![42]));
+        assert_eq!(a.fill_count, 1);
+        assert_eq!(a.pending.len(), 0);
+        assert!((a.accounting.position_size() - 0.5).abs() < 1e-12);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restores_live_state_across_restarts() {
+        let dir = temp_dir("restore");
+        {
+            let mut a = actor(&dir);
+            a.handle_event(PnlEvent::RegisterClientIds(vec![42]));
+            a.handle_event(PnlEvent::AccountAll {
+                position: None,
+                trades: vec![trade(1, 42, Side::Sell, Some("1.25"))],
+            });
+            a.flush_all();
+        }
+        // "Restart": a fresh actor over the same persist dir restores cumulative state.
+        let b = actor(&dir);
+        assert_eq!(b.fill_count, 1);
+        assert!((b.strategy_realized_pnl_usdc - 1.25).abs() < 1e-12);
         fs::remove_dir_all(&dir).ok();
     }
 

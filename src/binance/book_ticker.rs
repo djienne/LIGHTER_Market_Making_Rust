@@ -70,7 +70,11 @@ impl BinanceBookTickerClient {
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("binance bookTicker connected: {url}");
         loop {
-            match timeout(Duration::from_secs(30), read.next()).await {
+            // @bookTicker only emits on BBO CHANGE: a quiet symbol can be silent well past
+            // 30s (the old timeout flapped the connection and reset SharedBbo). Binance
+            // server pings arrive every few minutes and also count as liveness; downstream
+            // consumers gate on age_ms anyway. 300s only catches genuinely dead sockets.
+            match timeout(Duration::from_secs(300), read.next()).await {
                 Ok(Some(Ok(Message::Text(t)))) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&t) {
                         // {b,B,a,A,u,E,T}

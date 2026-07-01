@@ -120,42 +120,41 @@ impl TradeLogger {
         &self.symbol
     }
 
-    /// Write the CSV header if the file is missing/empty, or migrate an existing
-    /// file whose first row isn't the canonical header by re-padding columns.
+    /// Write the CSV header if the file is missing/empty. Reads only the FIRST record —
+    /// the old implementation parsed the ENTIRE historical file into memory on every start
+    /// and aborted LIVE startup on any malformed record. A legacy/corrupt file is now
+    /// renamed aside (data preserved) and a fresh canonical file started, so the trade log
+    /// can never block the bot from starting.
     fn ensure_header(&self) -> std::io::Result<()> {
         let _guard = self.write_lock.lock();
         if self.path.exists() && fs::metadata(&self.path)?.len() > 0 {
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(false)
-                .flexible(true)
-                .from_path(&self.path)?;
-            let mut rows: Vec<Vec<String>> = Vec::new();
-            for rec in rdr.records() {
-                let rec = rec?;
-                rows.push(rec.iter().map(|s| s.to_string()).collect());
-            }
-            if let Some(first) = rows.first() {
-                if first.as_slice() == HEADER {
-                    return Ok(());
-                }
-                if !first.is_empty() {
-                    // Re-pad legacy rows to the canonical column count, write a
-                    // fresh header, then the (padded) data rows. Mirrors Python.
-                    let mut padded: Vec<Vec<String>> = Vec::with_capacity(rows.len().saturating_sub(1));
-                    for row in rows.iter().skip(1) {
-                        let mut r = row.clone();
-                        if r.len() < HEADER.len() {
-                            r.resize(HEADER.len(), String::new());
-                        }
-                        padded.push(r);
+            let first: Option<Vec<String>> = (|| {
+                let mut rdr = csv::ReaderBuilder::new()
+                    .has_headers(false)
+                    .flexible(true)
+                    .from_path(&self.path)
+                    .ok()?;
+                let rec = rdr.records().next()?.ok()?;
+                Some(rec.iter().map(|s| s.to_string()).collect())
+            })();
+            match first {
+                Some(row) if row.as_slice() == HEADER => return Ok(()),
+                _ => {
+                    // Legacy header or unreadable file: preserve it under a new name and
+                    // start fresh (never rewrite in place, never abort startup).
+                    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+                    let aside = self.path.with_extension(format!("csv.legacy-{stamp}"));
+                    match fs::rename(&self.path, &aside) {
+                        Ok(()) => tracing::warn!(
+                            "trade log {} had a non-canonical header; moved aside to {}",
+                            self.path.display(),
+                            aside.display()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "trade log {} non-canonical and rename-aside failed ({e}); overwriting",
+                            self.path.display()
+                        ),
                     }
-                    let mut wtr = csv::WriterBuilder::new().from_path(&self.path)?;
-                    wtr.write_record(HEADER)?;
-                    for row in padded {
-                        wtr.write_record(&row)?;
-                    }
-                    wtr.flush()?;
-                    return Ok(());
                 }
             }
         }
@@ -213,8 +212,10 @@ impl TradeLogger {
         Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
     }
 
-    /// Append buffered rows to disk. On I/O failure, rows are prepended back into
-    /// the buffer for retry and the error is returned.
+    /// Append buffered rows to disk. On I/O failure the batch is DROPPED with a loud error:
+    /// `write_all` may have written part of the payload, so re-queueing would append the
+    /// same rows after a truncated partial row — duplicated/garbled audit data is worse
+    /// than a logged gap.
     pub fn flush(&self) -> std::io::Result<()> {
         let rows = {
             let mut buf = self.buffer.lock();
@@ -227,11 +228,10 @@ impl TradeLogger {
         match self.write_rows(&rows) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // Prepend (preserving order) for retry on next flush.
-                let mut buf = self.buffer.lock();
-                let mut combined = rows;
-                combined.append(&mut buf);
-                *buf = combined;
+                tracing::error!(
+                    "trade log flush failed; DROPPING {} row(s) to avoid duplicate/garbled audit rows: {e}",
+                    rows.len()
+                );
                 Err(e)
             }
         }

@@ -44,10 +44,12 @@ impl SharedAlpha {
         }
     }
 
-    /// Store a fresh alpha (depth task). Increments sample count (Release "commits").
+    /// Store a fresh alpha (depth task). Payload stores are Relaxed; the timestamp and
+    /// sample-count stores are the Release "commit" (readers Acquire-load one of them
+    /// before touching the payload — no-op on x86, required ordering on ARM).
     pub fn update(&self, alpha: f64) {
         store_f64(&self.alpha_bits, alpha, Ordering::Relaxed);
-        self.last_update_ms.store(now_ms(), Ordering::Relaxed);
+        self.last_update_ms.store(now_ms(), Ordering::Release);
         self.sample_count.fetch_add(1, Ordering::Release);
     }
 
@@ -63,7 +65,7 @@ impl SharedAlpha {
 
     #[inline]
     pub fn age_ms(&self) -> u64 {
-        let last = self.last_update_ms.load(Ordering::Relaxed);
+        let last = self.last_update_ms.load(Ordering::Acquire);
         if last == 0 {
             u64::MAX
         } else {
@@ -78,7 +80,7 @@ impl SharedAlpha {
 
     #[inline]
     pub fn is_stale(&self, threshold_ms: u64) -> bool {
-        let last = self.last_update_ms.load(Ordering::Relaxed);
+        let last = self.last_update_ms.load(Ordering::Acquire);
         last == 0 || now_ms().saturating_sub(last) > threshold_ms
     }
 
@@ -133,7 +135,8 @@ impl SharedBbo {
         store_f64(&self.best_ask, ask, Ordering::Relaxed);
         store_f64(&self.bid_qty, bid_qty, Ordering::Relaxed);
         store_f64(&self.ask_qty, ask_qty, Ordering::Relaxed);
-        self.last_update_ms.store(now_ms(), Ordering::Relaxed);
+        // Release "commit" fields; readers Acquire-load them before the payload.
+        self.last_update_ms.store(now_ms(), Ordering::Release);
         self.sample_count.fetch_add(1, Ordering::Release);
     }
 
@@ -159,7 +162,7 @@ impl SharedBbo {
     }
     #[inline]
     pub fn age_ms(&self) -> u64 {
-        let last = self.last_update_ms.load(Ordering::Relaxed);
+        let last = self.last_update_ms.load(Ordering::Acquire);
         if last == 0 {
             u64::MAX
         } else {
@@ -168,7 +171,7 @@ impl SharedBbo {
     }
     #[inline]
     pub fn is_stale(&self, threshold_ms: u64) -> bool {
-        let last = self.last_update_ms.load(Ordering::Relaxed);
+        let last = self.last_update_ms.load(Ordering::Acquire);
         last == 0 || now_ms().saturating_sub(last) > threshold_ms
     }
     /// Reset on a Binance bookTicker reconnect (Python `SharedBBO.reset`): zero values + count
@@ -235,6 +238,9 @@ pub struct Derived {
     /// every book message; the sender reads its age as a "market-data feed healthy" proxy
     /// (Python `check_websocket_health`) when deciding whether to resume after a pause. 0 == none.
     last_md_ms: AtomicU64,
+    /// Latest Lighter book mid (hot task, every tick). PnL marks against THIS (same venue —
+    /// no cross-exchange basis), falling back to the Binance BBO only when it is stale.
+    mid_bits: AtomicU64,
 }
 
 impl Default for Derived {
@@ -251,6 +257,7 @@ impl Derived {
             available_capital: AtomicU64::new(0),
             quota_remaining: AtomicU64::new(u64::MAX),
             last_md_ms: AtomicU64::new(0),
+            mid_bits: AtomicU64::new(0),
         }
     }
 
@@ -258,6 +265,18 @@ impl Derived {
     #[inline]
     pub fn set_md_now(&self) {
         self.last_md_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Publish the latest Lighter mid (hot task, every tick). Freshness = `md_age_ms`.
+    #[inline]
+    pub fn set_mid(&self, mid: f64) {
+        store_f64(&self.mid_bits, mid, Ordering::Relaxed);
+    }
+
+    /// Latest Lighter mid; 0.0 until the first book tick.
+    #[inline]
+    pub fn mid(&self) -> f64 {
+        load_f64(&self.mid_bits, Ordering::Relaxed)
     }
 
     /// Age in ms since the last market-data update; `u64::MAX` if none yet (Python WS-health).

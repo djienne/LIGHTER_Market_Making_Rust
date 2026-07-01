@@ -32,4 +32,4 @@ USER lighter
 ENV RUST_LOG=info
 
 ENTRYPOINT ["/usr/local/bin/lighter-mm"]
-CMD ["--symbol", "BTC", "--config", "/app/config.json", "--shadow"]
+CMD ["--symbol", "BTC", "--config", "/app/config.json", "--dry-run"]

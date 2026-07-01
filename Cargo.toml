@@ -37,6 +37,8 @@ crossbeam = "0.8"
 crossbeam-utils = "0.8"
 parking_lot = "0.12"
 arc-swap = "1"
+smallvec = "1"
+core_affinity = "0.8"
 
 # Fast float parsing
 fast-float = "0.2"

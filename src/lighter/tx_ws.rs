@@ -35,9 +35,9 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<Ws, Message>;
 type WsStream = SplitStream<Ws>;
 
-/// Proactive client-ping interval. Lighter closes connections idle for 2 minutes, so this must
-/// be comfortably under 120s (the Python uses `ping_interval=20`).
-const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// Default proactive client-ping interval. Lighter closes connections idle for 2 minutes, so
+/// this must be comfortably under 120s (config `websocket.ping_interval` overrides it).
+const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Max wait for a tx response after the frame is written before declaring the outcome Unknown.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -70,13 +70,22 @@ impl Drop for Conn {
 
 pub struct TxWebSocket {
     url: String,
+    ping_interval: Duration,
     conn: Mutex<Option<Conn>>,
 }
 
 impl TxWebSocket {
     pub fn new(url: &str) -> Self {
+        Self::with_ping_interval(url, DEFAULT_PING_INTERVAL)
+    }
+
+    /// Construct with a config-driven keepalive interval (clamped under Lighter's 2-min
+    /// idle-close window).
+    pub fn with_ping_interval(url: &str, ping_interval: Duration) -> Self {
+        let secs = ping_interval.as_secs_f64().clamp(5.0, 110.0);
         Self {
             url: url.to_string(),
+            ping_interval: Duration::from_secs_f64(secs),
             conn: Mutex::new(None),
         }
     }
@@ -97,12 +106,12 @@ impl TxWebSocket {
         let (resp_tx, resp_rx) = mpsc::unbounded_channel::<Value>();
 
         let recv_task = tokio::spawn(recv_loop(stream, write.clone(), alive.clone(), resp_tx));
-        let ping_task = tokio::spawn(ping_loop(write.clone(), alive.clone()));
+        let ping_task = tokio::spawn(ping_loop(write.clone(), alive.clone(), self.ping_interval));
 
         tracing::info!(
             "TxWebSocket connected to {} (keepalive recv-loop + {}s pinger)",
             self.url,
-            PING_INTERVAL.as_secs()
+            self.ping_interval.as_secs()
         );
         Ok(Conn {
             write,
@@ -259,10 +268,10 @@ async fn recv_loop(
     // resp_tx drops here -> any send_batch awaiting resp_rx.recv() gets None (Unknown).
 }
 
-/// Background pinger: sends a WS Ping every `PING_INTERVAL` so the connection keeps emitting a
+/// Background pinger: sends a WS Ping every `interval` so the connection keeps emitting a
 /// client frame well within Lighter's 2-minute idle-close window. Exits when the socket dies.
-async fn ping_loop(write: Arc<Mutex<WsSink>>, alive: Arc<AtomicBool>) {
-    let mut tick = tokio::time::interval(PING_INTERVAL);
+async fn ping_loop(write: Arc<Mutex<WsSink>>, alive: Arc<AtomicBool>, interval: Duration) {
+    let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // first tick fires immediately; skip it (just connected)
     loop {

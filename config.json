@@ -37,6 +37,7 @@
             "adverse_boost_per_bps": 0.03
         },
         "quote_engine": "vol_obi",
+        "set_leverage_on_startup": true,
         "vol_obi": {
             "window_steps": 6000,
             "step_ns": 100000000,
@@ -62,6 +63,7 @@
     "performance": {
         "min_loop_interval": 0.1,
         "rate_limit_send_interval": 0.15,
+        "pin_hot_core": null,
         "quota_recovery": {
             "enabled": false,
             "trigger_threshold": 5,
@@ -74,7 +76,7 @@
     },
     "websocket": {
         "ping_interval": 20,
-        "recv_timeout": 30.0,
+        "recv_timeout": 10.0,
         "account_recv_timeout": 1800.0,
         "reconnect_base_delay": 5,
         "reconnect_max_delay": 60
@@ -87,7 +89,10 @@
         "order_reconcile_timeout_sec": 2.0,
         "max_live_orders_per_market": 4,
         "panic_close_on_startup": false,
-        "panic_close_on_shutdown": false
+        "panic_close_on_shutdown": false,
+        "md_deadman_sec": 10.0,
+        "book_sanity_divergence_bps": 50.0,
+        "position_change_hold_sec": 3.0
     },
     "pnl": {
         "enabled": true,

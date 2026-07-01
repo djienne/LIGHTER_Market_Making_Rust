@@ -23,11 +23,21 @@ LIGHTER_ENV_FILE=/path/to/.env docker compose up -d
 
 Live startup behavior:
 
+- Refuses to start on a missing or malformed `config.json` (live never falls back to defaults)
+  and validates leverage / levels / sizing values.
 - Immediately loads the signer and acquires the per-account live instance lock.
-- Connects the transaction websocket and private account streams.
+- Sends an update-leverage transaction so the venue's margin model matches
+  `trading.leverage` / `trading.margin_mode` (disable with `trading.set_leverage_on_startup=false`
+  if the account is already configured and the tx is rejected).
+- Connects the transaction websocket and private account streams (`account_all`, `user_stats`,
+  and `account_orders` for instant exchange-id resolution).
 - Runs cancel-all and verifies `0 active orders` before enabling the strategy.
 - Logs `LIVE mode: order sending ENABLED` once live infrastructure is active.
 - Still observes `trading.vol_obi.warmup_seconds` from `config.json` before normal quote placement.
+
+While running, a dead-man switch cancels all resting orders and pauses trading if the market-data
+feed goes stale for more than `safety.md_deadman_sec` (default 10s); trading resumes automatically
+once the feed and reconcile are healthy again.
 
 With the current `config.json`, `warmup_seconds` is `600`, so normal live quote orders should not be
 placed for roughly the first 10 minutes after the market loop starts. If the account already holds
@@ -37,10 +47,10 @@ no normal quote orders until warmup completes.
 ## No-Order Validation Run
 
 To validate market-data connectivity and quote calculation without submitting exchange orders, run
-the binary's `--shadow` mode explicitly. Logs show this as `mode=Shadow`.
+the binary's `--dry-run` mode explicitly. Logs show this as `mode=DryRun`.
 
 ```bash
-docker compose run --rm --no-deps lighter-mm --symbol BTC --config /app/config.json --shadow
+docker compose run --rm --no-deps lighter-mm --symbol BTC --config /app/config.json --dry-run
 ```
 
 ## Stop And Verify
